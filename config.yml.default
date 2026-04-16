@@ -132,6 +132,21 @@ correspondence:
   checkin_period: 300              # How often to check for opponent moves in correspondence games after disconnecting.
   disconnect_time: 150             # Time before disconnecting from a correspondence game.
   ponder: false                    # Ponder in correspondence games the bot is connected to.
+# concurrency: 0                  # (Fork) Max total ongoing correspondence games at any one time.
+#                                  # 0 (default) = no correspondence games accepted.
+#                                  # Correspondence games sit in a FIFO queue and check in
+#                                  # periodically (checkin_period). When it's the bot's turn they
+#                                  # borrow a free CPU core briefly. Simultaneous calculation is
+#                                  # always bounded by challenge.concurrency (the CPU cap).
+# allow_matchmaking: false         # (Fork) Send outbound correspondence challenges.
+#                                  # Requires concurrency > 0 and challenge_days to be set.
+# challenge_timeout: 60            # (Fork) Minutes to wait between outbound correspondence challenges.
+# challenge_days: [1, 3]           # Days per move for outbound correspondence challenges.
+#                                  # Required when allow_matchmaking is true.
+# challenge_variant: "standard"    # Variant for outbound correspondence challenges.
+# challenge_mode: "rated"          # Mode for outbound correspondence challenges ("rated"/"casual").
+# opponent_min_rating: 1000        # Min opponent rating for outbound correspondence challenges.
+# opponent_max_rating: 3500        # Max opponent rating for outbound correspondence challenges.
 
 challenge:                         # Incoming challenges.
   concurrency: 1                   # Number of games to play simultaneously.
@@ -250,4 +265,79 @@ matchmaking:
 #       - 3
 #     challenge_mode: casual
 #
+
+# --- Fork: Per-Slot Matchmaking ---
+# When `slots` is present under `matchmaking`, it replaces allow_matchmaking + overrides.
+# Each slot entry can represent one or more real-time concurrency units via the optional
+# `concurrency` field (default 1). The sum of all slot concurrency values must not exceed
+# challenge.concurrency. Slots with concurrency > 1 are logged as name[0], name[1], etc.,
+# and each unit sends outgoing challenges independently on its own challenge_timeout timer.
+# Config list order determines which slot gets first pick when multiple slots accept
+# the same incoming challenge (expanded units of the same entry are all adjacent).
+# Omit `slots` entirely to keep the default allow_matchmaking / overrides behaviour.
+#
+# Stacking filters: the global challenge: settings are checked first (block_list, variants,
+# overall rating bounds, etc.). Slot-level fields (accept_bot, time_controls, …) are
+# additional per-slot constraints applied after the global check passes.
+#
+# Optimal challenge_timeout to stay under B outgoing challenges/day across N total slot units:
+#   challenge_timeout (minutes) >= (1440 * N / B) - avg_game_duration_minutes
+# Example: 3 bullet slot units (concurrency: 3), B = 75 challenges/day, avg 5 min:
+#   challenge_timeout >= (1440 * 3 / 75) - 5 = ~53 min for the bullet slot.
+#
+# matchmaking:
+#   slots:
+#     - name: "human_only"              # Label used in log output. Required; must be unique.
+#       allow_matchmaking: false        # Never sends outgoing challenges for this slot.
+#       accept_bot: false               # Reject bot challengers (human-only slot).
+#       correspondence_allowed: true    # (Fork) Allow correspondence check-ins in this slot when
+#                                       # it is not occupied by a real-time game.
+#       correspondence_eviction: "none" # (Fork) What to do when a real-time challenge arrives while
+#                                       # a correspondence check-in occupies this slot:
+#                                       #   "none"      – challenge waits; slot blocks until the
+#                                       #                 correspondence game disconnects naturally.
+#                                       #   "play_best" – send UCI stop; play whatever the engine
+#                                       #                 reports; free slot when process exits.
+#                                       #   "requeue"   – send UCI stop; skip the move; put the
+#                                       #                 game back in the correspondence queue;
+#                                       #                 free slot when process exits.
+#                                       # The slot is NEVER freed before local_game_done fires, so
+#                                       # challenge.concurrency is never exceeded.
+#                                       # Any challenge: field can be set here to further restrict
+#                                       # which incoming challenges are routed to this slot.
+#                                       # Fields not listed inherit from the global challenge: config.
+#
+#     - name: "long_tc"
+#       accept_bot: true
+#       time_controls:                  # Only incoming challenges of these speeds fill this slot.
+#         - rapid
+#         - classical
+#       allow_matchmaking: true         # Send outgoing challenges when this slot is free.
+#       challenge_initial_time:
+#         - 900
+#         - 1800
+#       challenge_increment:
+#         - 10
+#         - 15
+#       challenge_timeout: 30           # Minutes after game ends before challenging again.
+#       opponent_min_rating: 1500
+#       opponent_max_rating: 3500
+#       challenge_mode: "rated"
+#
+#     - name: "bullet_blitz"
+#       concurrency: 2                  # Creates bullet_blitz[0] and bullet_blitz[1] — two identical
+#                                       # slots that each challenge independently. Omit for concurrency: 1.
+#       accept_bot: true
+#       time_controls:
+#         - bullet
+#         - blitz
+#       allow_matchmaking: true
+#       challenge_initial_time:
+#         - 60
+#         - 120
+#       challenge_increment:
+#         - 0
+#         - 1
+#       challenge_timeout: 53           # (1440 * 3 / 75) - 5 = ~53 min with 3 total active slots.
+#       challenge_mode: "rated"
 # The following configurations cannot be overridden: allow_matchmaking, challenge_timeout, challenge_filter and block_list.

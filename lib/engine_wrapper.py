@@ -13,6 +13,8 @@ import time
 import random
 import math
 import contextlib
+import threading  # Fork: for _search_with_preemption watchdog
+import multiprocessing.synchronize  # Fork: for preempt_event type annotation
 from collections import Counter
 from collections.abc import Callable
 from lib import model, lichess
@@ -125,8 +127,9 @@ class EngineWrapper:
                  traceback: TracebackType | None) -> None:
         """Exit context and allow engine to shutdown nicely if there was no exception."""
         if exc_type is None:
-            self.ping()
-            self.quit()
+            with contextlib.suppress(chess.engine.EngineTerminatedError):
+                self.ping()
+                self.quit()
         self.engine.__exit__(exc_type, exc_value, traceback)
 
     def play_move(self,
@@ -139,7 +142,9 @@ class EngineWrapper:
                   is_correspondence: bool,
                   correspondence_move_time: datetime.timedelta,
                   engine_cfg: Configuration,
-                  min_time: datetime.timedelta) -> None:
+                  min_time: datetime.timedelta,
+                  preempt_event: "multiprocessing.synchronize.Event | None" = None,  # Fork
+                  correspondence_eviction: str = "none") -> None:  # Fork
         """
         Play a move.
 
@@ -153,8 +158,16 @@ class EngineWrapper:
         :param correspondence_move_time: The time the engine will think if `is_correspondence` is true.
         :param engine_cfg: Options for external moves (e.g. from an opening book), and for engine resignation and draw offers.
         :param min_time: Minimum time to spend, in seconds.
+        :param preempt_event: Fork — if set, stop the engine and skip/play the move per eviction mode.
+        :param correspondence_eviction: Fork — "none" | "play_best" | "requeue".
         :return: The move to play.
         """
+        # Fork: "requeue" preemption — skip the entire move without even starting any lookups.
+        # The preempt_event check at the top of the game loop will then exit the game.
+        if preempt_event is not None and preempt_event.is_set() \
+                and correspondence_eviction == "requeue":
+            return
+
         polyglot_cfg = engine_cfg.polyglot
         online_moves_cfg = engine_cfg.online_moves
         draw_or_resign_cfg = engine_cfg.draw_or_resign
@@ -184,7 +197,16 @@ class EngineWrapper:
                                                is_correspondence, correspondence_move_time)
 
             try:
-                best_move = self.search(board, time_limit, can_ponder, draw_offered, best_move)
+                if preempt_event is not None:
+                    # Fork: run search in a watchdog thread so stop_search() can interrupt it.
+                    result = self._search_with_preemption(
+                        board, time_limit, can_ponder, draw_offered, best_move,
+                        preempt_event, correspondence_eviction)
+                    if result is None:
+                        return  # Requeue: stop was sent, move found but not submitted.
+                    best_move = result
+                else:
+                    best_move = self.search(board, time_limit, can_ponder, draw_offered, best_move)
             except chess.engine.EngineError as error:
                 BadMove = (chess.IllegalMoveError, chess.InvalidMoveError)
                 if not any(isinstance(e, BadMove) for e in error.args):
@@ -206,6 +228,101 @@ class EngineWrapper:
             li.resign(game.id)
         else:
             li.make_move(game.id, best_move)
+
+    def stop_search(self) -> None:
+        """
+        Send a stop command to interrupt a running engine search.
+
+        Thread-safe: designed to be called from a different thread while
+        ``search()`` is blocking in another thread.
+
+        For UCI engines:   sends ``stop``; the engine reports the best move found so far.
+        For XBoard engines: sends ``?``; the engine makes an immediate move.
+        For homemade (MinimalEngine) engines: no-op — the engine's own ``search()``
+        must handle interruption itself.
+        """
+        engine = self.engine
+        if not hasattr(engine, "protocol"):
+            return  # MinimalEngine (FillerEngine) — no subprocess to poke.
+        protocol = engine.protocol
+        cmd = "?" if isinstance(protocol, chess.engine.XBoardProtocol) else "stop"
+        protocol.loop.call_soon_threadsafe(protocol.send_line, cmd)
+
+    def quit_search(self) -> None:
+        """
+        Send a quit command to terminate a running engine immediately.
+
+        Unlike ``stop_search()``, the engine will NOT report a bestmove — it exits
+        immediately. Use this for "requeue" eviction where the move will not be submitted.
+
+        Thread-safe: designed to be called from a different thread while
+        ``search()`` is blocking in another thread.
+
+        For homemade (MinimalEngine) engines: no-op.
+        """
+        engine = self.engine
+        if not hasattr(engine, "protocol"):
+            return  # MinimalEngine (FillerEngine) — no subprocess to poke.
+        protocol = engine.protocol
+        protocol.loop.call_soon_threadsafe(protocol.send_line, "quit")
+
+    def _search_with_preemption(
+        self,
+        board: chess.Board,
+        time_limit: chess.engine.Limit,
+        ponder: bool,
+        draw_offered: bool,
+        root_moves: MOVE,
+        preempt_event: "multiprocessing.synchronize.Event",
+        correspondence_eviction: str,
+    ) -> "chess.engine.PlayResult | None":
+        """
+        Run ``search()`` in a background thread and interrupt it via ``stop_search()``
+        when ``preempt_event`` is set.
+
+        Returns:
+            ``None``           — "requeue": stop was sent; move found but caller should NOT submit it.
+            ``PlayResult``     — "play_best": stop was sent; caller should submit this move.
+            ``PlayResult``     — preempt_event was never set; normal search result, always submit.
+
+        Any exception raised by ``search()`` is re-raised here so that the existing
+        ``EngineError`` handling in ``play_move()`` can catch it.
+        """
+        result_holder: list[chess.engine.PlayResult | None] = [None]
+        exc_holder: list[BaseException | None] = [None]
+
+        def run_search() -> None:
+            try:
+                result_holder[0] = self.search(board, time_limit, ponder, draw_offered, root_moves)
+            except BaseException as exc:
+                exc_holder[0] = exc
+
+        t = threading.Thread(target=run_search, daemon=True)
+        t.start()
+
+        signalled = False
+        while t.is_alive():
+            if preempt_event.is_set():
+                if correspondence_eviction == "requeue":
+                    self.quit_search()  # Engine exits immediately; no bestmove needed.
+                else:
+                    self.stop_search()  # UCI "stop" / XBoard "?": engine reports bestmove.
+                signalled = True
+                break
+            t.join(timeout=0.05)  # 50 ms polling; cheap since this only runs for correspondence.
+
+        t.join()  # Wait for the engine to respond and the thread to exit.
+
+        if exc_holder[0] is not None:
+            # For "requeue" + "quit", EngineTerminatedError is expected — return None cleanly.
+            if (signalled and correspondence_eviction == "requeue"
+                    and isinstance(exc_holder[0], chess.engine.EngineTerminatedError)):
+                return None
+            raise exc_holder[0]
+
+        if signalled and correspondence_eviction == "requeue":
+            return None  # Signal to play_move: don't submit this move.
+        return result_holder[0]
 
     def add_go_commands(self, time_limit: chess.engine.Limit) -> chess.engine.Limit:
         """Add extra commands to send to the engine. For example, to search for 1000 nodes or up to depth 10."""

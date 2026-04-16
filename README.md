@@ -15,6 +15,16 @@
 
 </div>
 
+> **This is a fork of [lichess-bot-devs/lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) with per-slot matchmaking and correspondence concurrency features. The fork was developed with AI assistance (Claude Code / Anthropic).**
+>
+> **New in this fork:**
+> - **Per-slot matchmaking** (`matchmaking.slots`) — assign each concurrency slot its own time-control, variant, or rating filter instead of sharing a single pool. Slots can be configured independently to seek different opponent types simultaneously.
+> - **Correspondence concurrency** (`correspondence.concurrency`) — run correspondence check-ins alongside real-time games without consuming real-time slots.
+> - **Correspondence slot preemption** — when a real-time challenge arrives and a correspondence check-in occupies a slot, the slot can be configured to evict the correspondence game (`play_best` submits the engine's best move before exiting; `requeue` exits without moving and requeues the game for later).
+> - **Outbound correspondence matchmaking** (`correspondence.allow_matchmaking`) — the bot can actively seek correspondence games against other bots.
+>
+> See `config.yml.default` for all new configuration options.
+
 ## Overview
 
 [lichess-bot](https://github.com/lichess-bot-devs/lichess-bot) is a free bridge

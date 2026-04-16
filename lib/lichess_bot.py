@@ -3,11 +3,12 @@ import argparse
 import chess
 import chess.pgn
 from chess.variant import find_variant
-from lib import engine_wrapper, model, lichess, matchmaking
+from lib import engine_wrapper, model, lichess, matchmaking, slot_manager
 import json
 import logging
 import logging.handlers
 import multiprocessing
+import multiprocessing.synchronize  # Fork: for preempt_event type annotation
 import signal
 import time
 import datetime
@@ -58,6 +59,8 @@ class PlayGameArgsType(TypedDict, total=False):
     logging_queue: LOGGING_QUEUE_TYPE
     pgn_queue: PGN_QUEUE_TYPE
     game_id: str
+    preempt_event: "multiprocessing.synchronize.Event | None"  # Fork: correspondence preemption
+    correspondence_eviction: str  # Fork: "none" | "play_best" | "requeue"
 
 
 class VersioningType(TypedDict):
@@ -342,6 +345,8 @@ def lichess_bot_main(li: lichess.Lichess,
     :param one_game: Whether the bot should play only one game. Only used in `test_bot/test_bot.py` to test lichess-bot.
     """
     max_games = config.challenge.concurrency
+    max_correspondence_games: int = config.correspondence.concurrency or 0  # Fork: separate correspondence concurrency
+    active_correspondence_game_ids: set[str] = set()  # Fork: tracks correspondence check-ins
 
     one_game_completed = False
 
@@ -356,7 +361,7 @@ def lichess_bot_main(li: lichess.Lichess,
     low_time_games: list[GameType] = []
 
     last_check_online_time = Timer(hours(1))
-    matchmaker = matchmaking.Matchmaking(li, config, user_profile)
+    matchmaker = slot_manager.SlotManager(li, config, user_profile)  # Fork: SlotManager wraps Matchmaking
     matchmaker.show_earliest_challenge_time()
 
     play_game_args = PlayGameArgsType(li=li, control_queue=control_queue, user_profile=user_profile,
@@ -372,7 +377,7 @@ def lichess_bot_main(li: lichess.Lichess,
         logger.info("When quitting, lichess-bot will first wait for all running games to finish.")
         logger.info("Press Ctrl-C twice to quit immediately.")
 
-    with multiprocessing.pool.Pool(max_games + 1) as pool:
+    with multiprocessing.pool.Pool(max_games + max_correspondence_games + 1) as pool:  # Fork: expanded for correspondence slots
         while not (stop.terminated or (one_game and one_game_completed) or stop.restart):
             event = next_event(control_queue)
             if not event:
@@ -385,22 +390,40 @@ def lichess_bot_main(li: lichess.Lichess,
                 break
 
             if event["type"] == "local_game_done":
-                active_games.discard(event["game"]["id"])
-                matchmaker.game_done()
+                game_id_done = event["game"]["id"]
+                active_games.discard(game_id_done)
+                is_corr_done = game_id_done in active_correspondence_game_ids  # Fork
+                active_correspondence_game_ids.discard(game_id_done)  # Fork: free correspondence slot
+                matchmaker.game_done(game_id_done)  # Fork: pass game_id for slot tracking
+                if is_corr_done:  # Fork: notify correspondence matchmaker
+                    matchmaker.correspondence_game_done()
                 log_proc_count("Freed", active_games)
                 one_game_completed = True
             elif event["type"] == "challenge":
-                handle_challenge(event,
-                                 li,
-                                 challenge_queue,
-                                 config.challenge,
-                                 user_profile,
-                                 recent_bot_challenges,
-                                 online_block_list)
+                # Fork: enforce correspondence game cap before queuing the challenge.
+                # correspondence.concurrency limits total ongoing games (queue + active),
+                # not simultaneous calculations. CPU concurrency is handled by challenge.concurrency.
+                challenge_speed = (event.get("challenge") or {}).get("speed")
+                correspondence_total = (correspondence_queue.qsize()
+                                        + len(active_correspondence_game_ids))
+                if (challenge_speed == "correspondence"
+                        and max_correspondence_games > 0
+                        and correspondence_total >= max_correspondence_games):
+                    li.decline_challenge(event["challenge"]["id"], reason="later")
+                else:
+                    handle_challenge(event,
+                                     li,
+                                     challenge_queue,
+                                     config.challenge,
+                                     user_profile,
+                                     recent_bot_challenges,
+                                     online_block_list)
             elif event["type"] == "challengeDeclined":
                 matchmaker.declined_challenge(event)
             elif event["type"] == "challengeCanceled":
-                active_games.discard(event["challenge"]["id"])
+                cancelled_id = event["challenge"]["id"]
+                active_games.discard(cancelled_id)
+                matchmaker.game_done(cancelled_id)  # Fork: free slot if an outbound challenge was cancelled
                 log_proc_count("Freed", active_games)
             elif event["type"] == "gameStart":
                 matchmaker.accepted_challenge(event)
@@ -420,9 +443,15 @@ def lichess_bot_main(li: lichess.Lichess,
                                              challenge_queue,
                                              play_game_args,
                                              active_games,
-                                             max_games)
-            accept_challenges(li, challenge_queue, active_games, max_games)
+                                             max_games,
+                                             active_correspondence_game_ids,   # Fork
+                                             max_correspondence_games,         # Fork
+                                             matchmaker)                        # Fork: slot assignment + preemption
+            slot_accept_challenges(li, challenge_queue, active_games, max_games, matchmaker)  # Fork: slot-aware accept
             matchmaker.challenge(active_games, challenge_queue, max_games)
+            corr_total = len(active_correspondence_game_ids) + correspondence_queue.qsize()  # Fork
+            matchmaker.challenge_correspondence(active_games, challenge_queue, max_games,    # Fork
+                                                corr_total, max_correspondence_games)         # Fork
             check_online_status(li, user_profile, last_check_online_time)
 
             control_queue.task_done()
@@ -469,7 +498,10 @@ def check_in_on_correspondence_games(pool: POOL_TYPE,
                                      challenge_queue: MULTIPROCESSING_LIST_TYPE,
                                      play_game_args: PlayGameArgsType,
                                      active_games: set[str],
-                                     max_games: int) -> None:
+                                     max_games: int,
+                                     active_correspondence_game_ids: set[str] | None = None,  # Fork
+                                     max_correspondence_games: int | None = None,             # Fork
+                                     matchmaker: "slot_manager.SlotManager | None" = None) -> None:  # Fork
     """Start correspondence games."""
     global correspondence_games_to_start
 
@@ -481,11 +513,47 @@ def check_in_on_correspondence_games(pool: POOL_TYPE,
     if challenge_queue:
         return
 
-    while len(active_games) < max_games and correspondence_games_to_start > 0:
-        game_id = correspondence_queue.get_nowait()
-        correspondence_games_to_start -= 1
-        correspondence_queue.task_done()
-        start_game_thread(active_games, game_id, play_game_args, pool)
+    # Fork: use CPU-cap-aware correspondence check-ins when configured.
+    # When max_correspondence_games is 0 (default) or None (legacy call), fall back to
+    # the original behaviour using active_games/max_games.
+    # When max_correspondence_games > 0, correspondence.concurrency controls the total number
+    # of ONGOING correspondence games (enforced at challenge acceptance, not here).
+    # Here we only gate on available CPU: start as many check-ins as free cores allow.
+    if max_correspondence_games is None or max_correspondence_games == 0:
+        # Legacy path: unchanged behaviour (also used when correspondence is disabled).
+        while len(active_games) < max_games and correspondence_games_to_start > 0:
+            game_id = correspondence_queue.get_nowait()
+            correspondence_games_to_start -= 1
+            correspondence_queue.task_done()
+            start_game_thread(active_games, game_id, play_game_args, pool)
+    else:
+        # Fork path: gate only on CPU capacity. Total game count is enforced at acceptance.
+        assert active_correspondence_game_ids is not None
+        use_slot_assignment = matchmaker is not None and matchmaker.has_correspondence_slots  # Fork
+        while correspondence_games_to_start > 0:
+            if len(active_games) >= max_games:
+                break  # No free CPU core; try again on next ping.
+            # Fork: in slot mode with correspondence_allowed slots, check for a free slot first.
+            if use_slot_assignment:
+                assert matchmaker is not None
+                slot = matchmaker.find_slot_for_correspondence_checkin()
+                if slot is None:
+                    break  # No free correspondence slot; wait for next ping.
+            game_id = correspondence_queue.get_nowait()
+            correspondence_games_to_start -= 1
+            correspondence_queue.task_done()
+            active_correspondence_game_ids.add(game_id)
+            if use_slot_assignment:
+                assert matchmaker is not None and slot is not None
+                event_obj: multiprocessing.synchronize.Event = multiprocessing.Event()
+                play_game_args["preempt_event"] = event_obj
+                play_game_args["correspondence_eviction"] = slot.correspondence_eviction
+                start_game_thread(active_games, game_id, play_game_args, pool)
+                matchmaker.register_correspondence_checkin(game_id, slot.index, event_obj)
+                play_game_args["preempt_event"] = None   # Reset for next call.
+                play_game_args["correspondence_eviction"] = "none"
+            else:
+                start_game_thread(active_games, game_id, play_game_args, pool)
 
 
 def start_low_time_games(low_time_games: list[GameType], active_games: set[str], max_games: int,
@@ -513,6 +581,81 @@ def accept_challenges(li: lichess.Lichess, challenge_queue: MULTIPROCESSING_LIST
         except (HTTPError, ReadTimeout) as exception:
             if isinstance(exception, HTTPError) and exception.response is not None and exception.response.status_code == 404:
                 logger.info(f"Skip missing {chlng}")
+
+
+# Fork: slot-aware replacement for accept_challenges when matchmaking.slots is configured.
+def slot_accept_challenges(li: lichess.Lichess,
+                           challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                           active_games: set[str],
+                           max_games: int,
+                           matchmaker: "slot_manager.SlotManager") -> None:
+    """
+    Accept incoming challenges, routing each to the best matching free slot.
+
+    In legacy mode (no slots configured), delegates to the original
+    ``accept_challenges()`` unchanged.
+
+    In slot mode, the queue is scanned non-sequentially so that a human challenge
+    is not stuck behind a bot challenge that no slot accepts.
+    """
+    if not matchmaker.use_slots:
+        accept_challenges(li, challenge_queue, active_games, max_games)
+        return
+
+    accepted_ids: set[str] = set()
+    for chlng in list(challenge_queue):
+        if chlng.from_self:
+            accepted_ids.add(chlng.id)
+            continue
+
+        # Correspondence challenges bypass the slot system entirely.
+        # They are not assigned to any real-time slot; capacity was already checked
+        # at challenge-event time (correspondence.concurrency). Accept directly.
+        if chlng.speed == "correspondence":
+            try:
+                logger.info(f"Accept correspondence {chlng}")
+                li.accept_challenge(chlng.id)
+                active_games.add(chlng.id)
+                accepted_ids.add(chlng.id)
+                log_proc_count("Queued", active_games)
+            except (HTTPError, ReadTimeout) as exception:
+                if isinstance(exception, HTTPError) and exception.response is not None \
+                        and exception.response.status_code == 404:
+                    logger.info(f"Skip missing {chlng}")
+                    accepted_ids.add(chlng.id)
+            continue
+
+        # Real-time challenge: find a matching free slot.
+        # We rely entirely on find_slot_for_challenge() for capacity — NOT on
+        # len(active_games) >= max_games — because correspondence check-ins temporarily
+        # inflate active_games without occupying a real-time slot, which would otherwise
+        # falsely block challenges from free slots.
+        assigned_slot = matchmaker.find_slot_for_challenge(chlng)
+        if assigned_slot is None:
+            # Fork: check if a correspondence check-in can be evicted to free a slot.
+            evictable = matchmaker.find_evictable_slot_for_challenge(chlng)
+            if evictable is not None:
+                logger.info(
+                    f"Preempting correspondence in slot '{evictable.name}' "
+                    f"(eviction={evictable.correspondence_eviction}) for {chlng}"
+                )
+                matchmaker.preempt_correspondence(evictable.index)
+            # Challenge stays in queue — will be accepted when slot frees via local_game_done.
+            continue
+        try:
+            logger.info(f"Accept {chlng} into slot '{assigned_slot.name}'")
+            li.accept_challenge(chlng.id)
+            active_games.add(chlng.id)
+            matchmaker.assign_game_to_slot(chlng.id, assigned_slot.index)
+            accepted_ids.add(chlng.id)
+            log_proc_count("Queued", active_games)
+        except (HTTPError, ReadTimeout) as exception:
+            if isinstance(exception, HTTPError) and exception.response is not None \
+                    and exception.response.status_code == 404:
+                logger.info(f"Skip missing {chlng}")
+                accepted_ids.add(chlng.id)
+    # Remove accepted (and self-) challenges from the shared queue.
+    challenge_queue[:] = [c for c in challenge_queue if c.id not in accepted_ids]
 
 
 def check_online_status(li: lichess.Lichess, user_profile: UserProfileType, last_check_online_time: Timer) -> None:
@@ -652,7 +795,9 @@ def play_game(li: lichess.Lichess,
               challenge_queue: MULTIPROCESSING_LIST_TYPE,
               correspondence_queue: CORRESPONDENCE_QUEUE_TYPE,
               logging_queue: LOGGING_QUEUE_TYPE,
-              pgn_queue: PGN_QUEUE_TYPE) -> None:
+              pgn_queue: PGN_QUEUE_TYPE,
+              preempt_event: "multiprocessing.synchronize.Event | None" = None,  # Fork
+              correspondence_eviction: str = "none") -> None:  # Fork
     """
     Play a game.
 
@@ -665,6 +810,8 @@ def play_game(li: lichess.Lichess,
     :param correspondence_queue: The queue containing the correspondence games.
     :param logging_queue: The logging queue. Used by `logging_listener_proc`.
     :param pgn_queue: The queue containing the PGN games.
+    :param preempt_event: Fork — if set, the correspondence check-in should stop ASAP.
+    :param correspondence_eviction: Fork — "none" | "play_best" | "requeue".
     """
     thread_logging_configurer(logging_queue)
     logger = logging.getLogger(__name__)
@@ -712,6 +859,14 @@ def play_game(li: lichess.Lichess,
             quit_after_all_games_finish = config.quit_after_all_games_finish
             stay_in_game = True
             while stay_in_game and (not stop.terminated or quit_after_all_games_finish) and not stop.force_quit:
+                # Fork: correspondence preemption — exit at first natural control point after signal.
+                # "requeue": skip any further move; exit now and let final_queue_entries requeue.
+                # "play_best": exit now if we're between moves (the engine already played).
+                # A preempt_event that fires DURING engine.play_move() below takes effect on the
+                # NEXT iteration here (after the blocking call returns naturally).
+                if preempt_event is not None and preempt_event.is_set():
+                    stay_in_game = False
+                    break
                 move_attempted = False
                 try:
                     upd = next_update(game_stream)
@@ -738,7 +893,9 @@ def play_game(li: lichess.Lichess,
                                              is_correspondence,
                                              correspondence_move_time,
                                              engine_cfg,
-                                             fake_think_time(config, board, game))
+                                             fake_think_time(config, board, game),
+                                             preempt_event,         # Fork: preemption
+                                             correspondence_eviction)  # Fork
                             time.sleep(to_seconds(delay))
                         elif is_game_over(game):
                             tell_user_game_result(game, board)
@@ -757,7 +914,8 @@ def play_game(li: lichess.Lichess,
                         terminate_time = msec(wbtime) + msec(wbinc) + seconds(60)
                         game.ping(abort_time, terminate_time, disconnect_time)
                         prior_game = copy.deepcopy(game)
-                    elif u_type == "ping" and should_exit_game(board, game, prior_game, li, is_correspondence):
+                    elif u_type == "ping" and (should_exit_game(board, game, prior_game, li, is_correspondence)
+                                               or (preempt_event is not None and preempt_event.is_set())):  # Fork
                         stay_in_game = False
                 except (HTTPError, ReadTimeout, RemoteDisconnected, ChunkedEncodingError, RequestsConnectionError,
                         StopIteration) as e:

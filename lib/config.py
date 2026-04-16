@@ -255,6 +255,25 @@ def insert_default_values(CONFIG: CONFIG_DICT_TYPE) -> None:
         for ponder in ["ponder", "uci_ponder"]:
             set_config_default(CONFIG, section, key=ponder, default=False)
 
+    # --- Fork additions (slot_manager.py / per-slot matchmaking) ---
+    # Separate concurrency for correspondence check-ins (0 = disabled).
+    set_config_default(CONFIG, "correspondence", key="concurrency", default=0, force_empty_values=True)
+    # Outbound correspondence matchmaking (disabled by default).
+    set_config_default(CONFIG, "correspondence", key="allow_matchmaking", default=False, force_empty_values=True)
+    # Normalise challenge_days in correspondence matchmaking (mirrors matchmaking section logic).
+    corr_cfg = CONFIG.get("correspondence") or {}
+    corr_days = corr_cfg.get("challenge_days")
+    if corr_days is not None and not isinstance(corr_days, list):
+        corr_cfg["challenge_days"] = [corr_days]
+
+    # Normalise list fields inside per-slot matchmaking configs.
+    # Mirrors the existing override normalisation above.
+    for slot in (CONFIG.get("matchmaking") or {}).get("slots") or []:
+        for param in ("challenge_initial_time", "challenge_increment"):
+            # challenge_days is intentionally excluded — correspondence is not handled in slots.
+            if param in slot and not isinstance(slot[param], list):
+                slot[param] = [slot[param]]
+
     for greeting in ["hello", "goodbye"]:
         for target in ["", "_spectators"]:
             set_config_default(CONFIG, "greeting", key=greeting + target, default="", force_empty_values=True)
@@ -420,6 +439,61 @@ def validate_config(CONFIG: CONFIG_DICT_TYPE) -> None:
                           f"`{explorer_choice}` is not a valid"
                           f" `engine:online_moves:lichess_opening_explorer:{parameter}`"
                           f" value. Please choose from {choice_list}.")
+
+    # --- Fork additions (slot_manager.py / per-slot matchmaking) ---
+    slots = (CONFIG.get("matchmaking") or {}).get("slots")
+    if slots is not None:
+        config_assert(
+            isinstance(slots, list) and len(slots) > 0,
+            "matchmaking.slots must be a non-empty list when present.",
+        )
+        config_assert(
+            all(isinstance(s.get("name"), str) for s in slots),
+            "Every entry in matchmaking.slots must have a string 'name' field.",
+        )
+        names = [s["name"] for s in slots]
+        config_assert(
+            len(set(names)) == len(names),
+            "Slot names in matchmaking.slots must be unique.",
+        )
+        for slot in slots:
+            slot_concurrency = slot.get("concurrency", 1)
+            config_assert(
+                isinstance(slot_concurrency, int) and slot_concurrency >= 1,
+                f"Slot '{slot.get('name', '?')}': concurrency must be a positive integer.",
+            )
+        total_slot_concurrency = sum(int(s.get("concurrency", 1)) for s in slots)
+        config_assert(
+            total_slot_concurrency <= CONFIG["challenge"]["concurrency"],
+            "Total slot concurrency in matchmaking.slots cannot exceed challenge.concurrency "
+            f"({total_slot_concurrency} > {CONFIG['challenge']['concurrency']}).",
+        )
+        valid_evictions = {"none", "play_best", "requeue"}
+        for slot in slots:
+            eviction = slot.get("correspondence_eviction", "none")
+            config_assert(
+                eviction in valid_evictions,
+                f"Slot '{slot.get('name', '?')}': correspondence_eviction must be one of "
+                f"{sorted(valid_evictions)}.",
+            )
+
+    corr_cfg = CONFIG.get("correspondence") or {}
+    corr_concurrency = corr_cfg.get("concurrency")
+    if corr_concurrency is not None:
+        config_assert(
+            isinstance(corr_concurrency, int) and corr_concurrency >= 0,
+            "correspondence.concurrency must be a non-negative integer (0 = disabled).",
+        )
+    if corr_cfg.get("allow_matchmaking"):
+        config_assert(
+            (corr_concurrency or 0) > 0,
+            "correspondence.allow_matchmaking requires correspondence.concurrency > 0.",
+        )
+        corr_days = corr_cfg.get("challenge_days")
+        config_assert(
+            bool(corr_days and any(d for d in corr_days if d)),
+            "correspondence.allow_matchmaking requires at least one non-zero challenge_days value.",
+        )
 
 
 def load_config(config_file: str) -> Configuration:
