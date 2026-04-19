@@ -346,7 +346,12 @@ def lichess_bot_main(li: lichess.Lichess,
     """
     max_games = config.challenge.concurrency
     max_correspondence_games: int = config.correspondence.concurrency or 0  # Fork: separate correspondence concurrency
-    active_correspondence_game_ids: set[str] = set()  # Fork: tracks correspondence check-ins
+    # Fork: tracks all ongoing correspondence games across their full lifetime, not just running check-ins.
+    # Seeded from get_ongoing_games() at startup so the cap is enforced before gameStart events arrive.
+    # Added to on gameStart, removed only on local_game_done(finished=True) when the game is truly over.
+    # Using len() alone (no + correspondence_queue.qsize()) avoids double-counting games that are
+    # both in this set and in the queue between check-ins.
+    active_correspondence_game_ids: set[str] = set()  # Fork
 
     one_game_completed = False
 
@@ -355,6 +360,8 @@ def lichess_bot_main(li: lichess.Lichess,
     startup_correspondence_games = [game["gameId"]
                                     for game in all_games
                                     if game["speed"] == "correspondence"]
+    if max_correspondence_games > 0:
+        active_correspondence_game_ids.update(startup_correspondence_games)  # Fork: prime the cap from startup
     active_games = {game["gameId"]
                     for game in all_games
                     if game["gameId"] not in startup_correspondence_games}
@@ -393,7 +400,8 @@ def lichess_bot_main(li: lichess.Lichess,
                 game_id_done = event["game"]["id"]
                 active_games.discard(game_id_done)
                 is_corr_done = game_id_done in active_correspondence_game_ids  # Fork
-                active_correspondence_game_ids.discard(game_id_done)  # Fork: free correspondence slot
+                if event.get("finished"):  # Fork: only remove from set when the game is truly over
+                    active_correspondence_game_ids.discard(game_id_done)
                 matchmaker.game_done(game_id_done)  # Fork: pass game_id for slot tracking
                 if is_corr_done:  # Fork: notify correspondence matchmaker
                     matchmaker.correspondence_game_done()
@@ -401,14 +409,11 @@ def lichess_bot_main(li: lichess.Lichess,
                 one_game_completed = True
             elif event["type"] == "challenge":
                 # Fork: enforce correspondence game cap before queuing the challenge.
-                # correspondence.concurrency limits total ongoing games (queue + active),
-                # not simultaneous calculations. CPU concurrency is handled by challenge.concurrency.
+                # correspondence.concurrency limits total ongoing games (not simultaneous calculations).
                 challenge_speed = (event.get("challenge") or {}).get("speed")
-                correspondence_total = (correspondence_queue.qsize()
-                                        + len(active_correspondence_game_ids))
                 if (challenge_speed == "correspondence"
                         and max_correspondence_games > 0
-                        and correspondence_total >= max_correspondence_games):
+                        and len(active_correspondence_game_ids) >= max_correspondence_games):  # Fork
                     li.decline_challenge(event["challenge"]["id"], reason="later")
                 else:
                     handle_challenge(event,
@@ -427,6 +432,11 @@ def lichess_bot_main(li: lichess.Lichess,
                 log_proc_count("Freed", active_games)
             elif event["type"] == "gameStart":
                 matchmaker.accepted_challenge(event)
+                # Fork: add to the correspondence set on every gameStart for correspondence speed.
+                # Covers outbound games (first check-in via start_game_thread, never via queue).
+                # Startup games are already in the set; set.add is idempotent.
+                if max_correspondence_games > 0 and event["game"].get("speed") == "correspondence":
+                    active_correspondence_game_ids.add(event["game"]["id"])
                 start_game(event,
                            pool,
                            play_game_args,
@@ -449,7 +459,7 @@ def lichess_bot_main(li: lichess.Lichess,
                                              matchmaker)                        # Fork: slot assignment + preemption
             slot_accept_challenges(li, challenge_queue, active_games, max_games, matchmaker)  # Fork: slot-aware accept
             matchmaker.challenge(active_games, challenge_queue, max_games)
-            corr_total = len(active_correspondence_game_ids) + correspondence_queue.qsize()  # Fork
+            corr_total = len(active_correspondence_game_ids)  # Fork: full game lifetime, not just active check-ins
             matchmaker.challenge_correspondence(active_games, challenge_queue, max_games,    # Fork
                                                 corr_total, max_correspondence_games)         # Fork
             check_online_status(li, user_profile, last_check_online_time)
@@ -705,7 +715,7 @@ def start_game_thread(active_games: set[str], game_id: str, play_game_args: Play
         control_queue = play_game_args["control_queue"]
         pgn_queue = play_game_args["pgn_queue"]
         li = play_game_args["li"]
-        control_queue.put_nowait({"type": "local_game_done", "game": {"id": game_id}})
+        control_queue.put_nowait({"type": "local_game_done", "game": {"id": game_id}, "finished": True})
         pgn_queue.put_nowait({"game": {"id": game_id,
                                        "pgn": li.get_game_pgn(game_id),
                                        "complete": not game_is_active(li, game_id)}})
@@ -1076,13 +1086,15 @@ def final_queue_entries(control_queue: CONTROL_QUEUE_TYPE, correspondence_queue:
 
      If this is an unfinished correspondence game, put it in a queue to resume later.
     """
-    if is_correspondence and not is_game_over(game):
+    game_continuing = is_correspondence and not is_game_over(game)
+    if game_continuing:
         logger.info(f"--- Disconnecting from {game.url()}")
         correspondence_queue.put_nowait(game.id)
     else:
         logger.info(f"--- {game.url()} Game over")
 
-    control_queue.put_nowait({"type": "local_game_done", "game": {"id": game.id}})
+    # Fork: "finished" signals the main loop to remove this game from active_correspondence_game_ids.
+    control_queue.put_nowait({"type": "local_game_done", "game": {"id": game.id}, "finished": not game_continuing})
     pgn_queue.put_nowait({"game": {"id": game.id,
                                    "pgn": pgn_record,
                                    "complete": is_game_over(game)}})
