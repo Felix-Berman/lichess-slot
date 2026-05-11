@@ -137,6 +137,34 @@ def change_value_to_list(config: CONFIG_DICT_TYPE, *sections: str, key: str) -> 
         subconfig[key] = [subconfig[key]]
 
 
+def insert_matchmaking_defaults(matchmaking_config: CONFIG_DICT_TYPE,
+                                *,
+                                challenge_timeout: int = 30,
+                                allow_matchmaking: bool = False,
+                                time_control_pools: CONFIG_DICT_TYPE | None = None) -> None:
+    """Insert default values for a matchmaking config block."""
+    set_config_default(matchmaking_config, key="challenge_timeout", default=challenge_timeout, force_empty_values=True)
+    matchmaking_config["challenge_timeout"] = max(matchmaking_config["challenge_timeout"], 1)
+    set_config_default(matchmaking_config, key="allow_matchmaking", default=allow_matchmaking)
+    set_config_default(matchmaking_config, key="challenge_initial_time", default=[None], force_empty_values=True)
+    change_value_to_list(matchmaking_config, key="challenge_initial_time")
+    set_config_default(matchmaking_config, key="challenge_increment", default=[None], force_empty_values=True)
+    change_value_to_list(matchmaking_config, key="challenge_increment")
+    set_config_default(matchmaking_config, key="challenge_time_controls", default=[], force_empty_values=True)
+    change_value_to_list(matchmaking_config, key="challenge_time_controls")
+    set_config_default(matchmaking_config, key="time_control_pools", default=time_control_pools or {},
+                       force_empty_values=True)
+    set_config_default(matchmaking_config, key="challenge_time_control_pools", default=[], force_empty_values=True)
+    change_value_to_list(matchmaking_config, key="challenge_time_control_pools")
+    set_config_default(matchmaking_config, key="challenge_days", default=[None], force_empty_values=True)
+    change_value_to_list(matchmaking_config, key="challenge_days")
+    set_config_default(matchmaking_config, key="opponent_min_rating", default=600, force_empty_values=True)
+    set_config_default(matchmaking_config, key="opponent_max_rating", default=4000, force_empty_values=True)
+    set_config_default(matchmaking_config, key="rating_preference", default="none")
+    set_config_default(matchmaking_config, key="challenge_variant", default="random")
+    set_config_default(matchmaking_config, key="challenge_mode", default="random")
+
+
 def insert_default_values(CONFIG: CONFIG_DICT_TYPE) -> None:
     """
     Insert the default values of most keys to the config if they are missing.
@@ -225,31 +253,40 @@ def insert_default_values(CONFIG: CONFIG_DICT_TYPE) -> None:
     set_config_default(CONFIG, "correspondence", key="checkin_period", default=600)
     set_config_default(CONFIG, "correspondence", key="move_time", default=60, force_empty_values=True)
     set_config_default(CONFIG, "correspondence", key="disconnect_time", default=300)
-    set_config_default(CONFIG, "matchmaking", key="challenge_timeout", default=30, force_empty_values=True)
-    CONFIG["matchmaking"]["challenge_timeout"] = max(CONFIG["matchmaking"]["challenge_timeout"], 1)
+    set_config_default(CONFIG, "correspondence", key="max_active_games", default=math.inf, force_empty_values=True)
+    slots_config = CONFIG.pop("slots", None)
+    if slots_config is None:
+        slots_config = (CONFIG.get("matchmaking") or {}).pop("slots", None)
+    CONFIG["slots"] = slots_config or {}
+    set_config_default(CONFIG, "slots", key="enabled", default=False)
+    set_config_default(CONFIG, "slots", key="definitions", default={}, force_empty_values=True)
+    set_config_default(CONFIG, key="matchmaking", default={})
+    insert_matchmaking_defaults(CONFIG["matchmaking"])
     set_config_default(CONFIG, "matchmaking", key="block_list", default=[], force_empty_values=True)
     set_config_default(CONFIG, "matchmaking", key="online_block_list", default=[], force_empty_values=True)
     set_config_default(CONFIG, "matchmaking", key="include_challenge_block_list", default=False, force_empty_values=True)
     default_filter = (CONFIG.get("matchmaking") or {}).get("delay_after_decline") or FilterType.NONE.value
     set_config_default(CONFIG, "matchmaking", key="challenge_filter", default=default_filter, force_empty_values=True)
-    set_config_default(CONFIG, "matchmaking", key="allow_matchmaking", default=False)
-    set_config_default(CONFIG, "matchmaking", key="challenge_initial_time", default=[None], force_empty_values=True)
-    change_value_to_list(CONFIG, "matchmaking", key="challenge_initial_time")
-    set_config_default(CONFIG, "matchmaking", key="challenge_increment", default=[None], force_empty_values=True)
-    change_value_to_list(CONFIG, "matchmaking", key="challenge_increment")
-    set_config_default(CONFIG, "matchmaking", key="challenge_days", default=[None], force_empty_values=True)
-    change_value_to_list(CONFIG, "matchmaking", key="challenge_days")
-    set_config_default(CONFIG, "matchmaking", key="opponent_min_rating", default=600, force_empty_values=True)
-    set_config_default(CONFIG, "matchmaking", key="opponent_max_rating", default=4000, force_empty_values=True)
-    set_config_default(CONFIG, "matchmaking", key="rating_preference", default="none")
-    set_config_default(CONFIG, "matchmaking", key="challenge_variant", default="random")
-    set_config_default(CONFIG, "matchmaking", key="challenge_mode", default="random")
     set_config_default(CONFIG, "matchmaking", key="overrides", default={}, force_empty_values=True)
     for override_config in CONFIG["matchmaking"]["overrides"].values():
-        for parameter in ["challenge_initial_time", "challenge_increment", "challenge_days"]:
+        for parameter in ["challenge_initial_time", "challenge_increment", "challenge_days", "challenge_time_controls",
+                          "challenge_time_control_pools"]:
             if parameter in override_config:
                 set_config_default(override_config, key=parameter, default=[None], force_empty_values=True)
                 change_value_to_list(override_config, key=parameter)
+
+    for slot_config in CONFIG["slots"]["definitions"].values():
+        set_config_default(slot_config, key="concurrency", default=1, force_empty_values=True)
+        set_config_default(slot_config, key="challenge_timeout", default=CONFIG["matchmaking"]["challenge_timeout"],
+                           force_empty_values=True)
+        set_config_default(slot_config, key="allow_correspondence", default=False)
+        set_config_default(slot_config, key="correspondence_interrupt", default="wait")
+        set_config_default(slot_config, key="challenge", default={}, force_empty_values=True)
+        set_config_default(slot_config, key="matchmaking", default={}, force_empty_values=True)
+        insert_matchmaking_defaults(slot_config["matchmaking"],
+                                    challenge_timeout=CONFIG["matchmaking"]["challenge_timeout"],
+                                    allow_matchmaking=True,
+                                    time_control_pools=CONFIG["matchmaking"]["time_control_pools"])
 
     for section in ["engine", "correspondence"]:
         for ponder in ["ponder", "uci_ponder"]:
@@ -364,13 +401,17 @@ def validate_config(CONFIG: CONFIG_DICT_TYPE) -> None:
 
     def has_valid_list(name: str) -> bool:
         entries = matchmaking.get(name)
-        return isinstance(entries, list) and entries[0] is not None
+        return isinstance(entries, list) and bool(entries) and entries[0] is not None
+    has_paired_time_controls = bool(matchmaking.get("challenge_time_controls")
+                                    or matchmaking.get("challenge_time_control_pools"))
     matchmaking_has_values = (has_valid_list("challenge_initial_time")
                               and has_valid_list("challenge_increment")
+                              or has_paired_time_controls
                               or has_valid_list("challenge_days"))
     config_assert(not matchmaking_enabled or matchmaking_has_values,
                   "The time control to challenge other bots is not set. Either lists of challenge_initial_time and "
-                  "challenge_increment is required, or a list of challenge_days, or both.")
+                  "challenge_increment is required, a list of challenge_time_controls, a list of "
+                  "challenge_time_control_pools, or a list of challenge_days.")
 
     filter_option = "challenge_filter"
     filter_type = matchmaking.get(filter_option)
@@ -381,6 +422,31 @@ def validate_config(CONFIG: CONFIG_DICT_TYPE) -> None:
     config_assert(matchmaking.get("rating_preference") in ["none", "high", "low"],
                   f"{matchmaking.get('rating_preference')} is not a valid `matchmaking:rating_preference` option. "
                   f"Valid options are 'none', 'high', or 'low'.")
+
+    slots = CONFIG.get("slots") or {}
+    config_assert(isinstance(slots.get("enabled"), bool), "slots.enabled must be true or false.")
+    config_assert(isinstance(slots.get("definitions"), dict),
+                  "slots.definitions must be a dictionary of slot names.")
+    for slot_name, slot_config in slots.get("definitions", {}).items():
+        config_assert(isinstance(slot_config, dict), f"slots.definitions.{slot_name} must be a dictionary.")
+        config_assert(slot_config.get("concurrency", 1) > 0,
+                      f"slots.definitions.{slot_name}.concurrency must be greater than zero.")
+        config_assert(slot_config.get("challenge_timeout", 1) >= 1,
+                      f"slots.definitions.{slot_name}.challenge_timeout must be at least 1 minute.")
+        config_assert(slot_config.get("correspondence_interrupt") in ["wait", "stop_move", "stop_queue"],
+                      f"slots.definitions.{slot_name}.correspondence_interrupt must be one of "
+                      "wait, stop_move, or stop_queue.")
+
+    time_control_pools = matchmaking.get("time_control_pools") or {}
+    config_assert(isinstance(time_control_pools, dict), "matchmaking.time_control_pools must be a dictionary.")
+    validate_time_control_pool_labels(matchmaking, time_control_pools, "matchmaking")
+    for override_name, override_config in matchmaking.get("overrides", {}).items():
+        validate_time_control_pool_labels(matchmaking | override_config, time_control_pools,
+                                          f"matchmaking.overrides.{override_name}")
+    for slot_name, slot_config in slots.get("definitions", {}).items():
+        slot_matchmaking = slot_config.get("matchmaking") or {}
+        validate_time_control_pool_labels(matchmaking | slot_matchmaking, time_control_pools,
+                                          f"slots.definitions.{slot_name}.matchmaking")
 
     selection_choices = {"polyglot": ["weighted_random", "uniform_random", "best_move"],
                          "chessdb_book": ["all", "good", "best"],
@@ -420,6 +486,17 @@ def validate_config(CONFIG: CONFIG_DICT_TYPE) -> None:
                           f"`{explorer_choice}` is not a valid"
                           f" `engine:online_moves:lichess_opening_explorer:{parameter}`"
                           f" value. Please choose from {choice_list}.")
+
+
+def validate_time_control_pool_labels(matchmaking: CONFIG_DICT_TYPE,
+                                      time_control_pools: CONFIG_DICT_TYPE,
+                                      config_location: str) -> None:
+    """Check that selected matchmaking time-control pool labels exist."""
+    selected_pools = list(filter(None, matchmaking.get("challenge_time_control_pools") or []))
+    missing_pools = [pool_name for pool_name in selected_pools if pool_name not in time_control_pools]
+    config_assert(not missing_pools,
+                  f"{config_location}.challenge_time_control_pools references undefined pool(s): "
+                  f"{', '.join(missing_pools)}.")
 
 
 def load_config(config_file: str) -> Configuration:

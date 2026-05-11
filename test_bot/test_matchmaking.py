@@ -1,7 +1,8 @@
 """Test functions for matchmaking module."""
 from unittest.mock import Mock
-from lib.matchmaking import game_category, Matchmaking
+from lib.matchmaking import configured_real_time_controls, choose_time_control, game_category, Matchmaking
 from lib.config import Configuration
+from lib.timer import seconds
 from lib.lichess_types import UserProfileType
 
 
@@ -224,3 +225,153 @@ def test_get_random_config_value__returns_from_choices_when_random() -> None:
     result = matchmaking.get_random_config_value(test_config, "challenge_mode", choices)
 
     assert result in choices, f"Expected result to be in {choices} but got '{result}'"
+
+
+def test_configured_real_time_controls__uses_explicit_pairs() -> None:
+    """Test that paired time controls do not cross-combine initial and increment values."""
+    match_config = Configuration({
+        "challenge_initial_time": [30, 1800],
+        "challenge_increment": [0, 30],
+        "challenge_time_controls": [
+            {"initial": 30, "increment": 0},
+            {"initial": 1800, "increment": 30},
+        ],
+    })
+
+    assert configured_real_time_controls(match_config) == [(30, 0), (1800, 30)]
+
+
+def test_configured_real_time_controls__uses_selected_labelled_pools() -> None:
+    """Test labelled pools let configs choose multiple independent groups."""
+    match_config = Configuration({
+        "challenge_initial_time": [30, 1800],
+        "challenge_increment": [0, 30],
+        "challenge_time_controls": [],
+        "time_control_pools": {
+            "short": [
+                {"initial": 60, "increment": 0},
+                {"initial": 120, "increment": 1},
+            ],
+            "long": [
+                {"initial": 600, "increment": 5},
+            ],
+        },
+        "challenge_time_control_pools": ["short", "long"],
+    })
+
+    assert configured_real_time_controls(match_config) == [(60, 0), (120, 1), (600, 5)]
+
+
+def test_configured_real_time_controls__uses_pool_cross_product() -> None:
+    """Test a labelled pool can define its own initial/increment product."""
+    match_config = Configuration({
+        "challenge_initial_time": [30],
+        "challenge_increment": [30],
+        "challenge_time_controls": [],
+        "time_control_pools": {
+            "increment": {
+                "challenge_initial_time": [180, 300],
+                "challenge_increment": [2, 3],
+            },
+        },
+        "challenge_time_control_pools": ["increment"],
+    })
+
+    assert configured_real_time_controls(match_config) == [(180, 2), (180, 3), (300, 2), (300, 3)]
+
+
+def test_configured_real_time_controls__falls_back_to_legacy_cross_product() -> None:
+    """Test old initial/increment behavior remains available by default."""
+    match_config = Configuration({
+        "challenge_initial_time": [60, 180],
+        "challenge_increment": [1, 2],
+        "challenge_time_controls": [],
+        "challenge_time_control_pools": [],
+        "time_control_pools": {},
+    })
+
+    assert configured_real_time_controls(match_config) == [(60, 1), (60, 2), (180, 1), (180, 2)]
+
+
+def test_choose_time_control__weights_correspondence_per_option(monkeypatch) -> None:
+    """Test correspondence is one option among all configured controls, not a fixed 50% branch."""
+    choices_seen = []
+
+    def fake_choice(choices):  # noqa: ANN001
+        choices_seen.append(choices)
+        return choices[0]
+
+    monkeypatch.setattr("lib.matchmaking.random.choice", fake_choice)
+    match_config = Configuration({
+        "challenge_initial_time": [60, 180],
+        "challenge_increment": [0, 2],
+        "challenge_time_controls": [],
+        "challenge_time_control_pools": [],
+        "time_control_pools": {},
+        "challenge_days": [1],
+    })
+
+    assert choose_time_control(match_config) == (60, 0, 0)
+    assert choices_seen[0] == ["clock", "clock", "clock", "clock", "correspondence"]
+
+
+def correspondence_matchmaking_config(max_active_games: int = 3) -> Configuration:
+    """Create a minimal config for correspondence matchmaking tests."""
+    return Configuration({
+        "challenge": {"variants": ["standard"]},
+        "correspondence": {"max_active_games": max_active_games},
+        "slots": {"enabled": True, "definitions": {}},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "block_list": [],
+            "online_block_list": [],
+            "challenge_timeout": 1,
+            "challenge_filter": "none",
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_initial_time": [60],
+            "challenge_increment": [0],
+            "challenge_time_controls": [],
+            "challenge_time_control_pools": [],
+            "challenge_days": [1],
+            "opponent_min_rating": 600,
+            "opponent_max_rating": 4000,
+            "opponent_rating_difference": None,
+            "rating_preference": "none",
+            "overrides": {},
+        },
+    })
+
+
+def test_challenge_correspondence__creates_daily_without_clock() -> None:
+    """Test the correspondence scheduler creates daily challenges outside slots."""
+    mock_li = Mock()
+    mock_li.get_ongoing_games.return_value = []
+    mock_li.get_online_bots.return_value = [
+        {"username": "otherbot", "perfs": {"correspondence": {"games": 1, "rating": 1500}}},
+    ]
+    mock_li.get_public_data.return_value = {"blocking": False}
+    mock_li.challenge.return_value = {"id": "abc123"}
+    user_profile: UserProfileType = {"username": "testbot", "perfs": {"correspondence": {"rating": 1500}}}
+    matchmaking = Matchmaking(mock_li, correspondence_matchmaking_config(), user_profile)
+    matchmaking.min_wait_time = seconds(0)
+
+    assert matchmaking.challenge_correspondence([]) is True
+    mock_li.challenge.assert_called_once()
+    _, params = mock_li.challenge.call_args.args
+    assert params["days"] == 1
+    assert "clock.limit" not in params
+    assert "clock.increment" not in params
+
+
+def test_challenge_correspondence__respects_correspondence_cap() -> None:
+    """Test no daily challenge is created when the separate correspondence cap is full."""
+    mock_li = Mock()
+    mock_li.get_ongoing_games.return_value = [{"speed": "correspondence"}]
+    user_profile: UserProfileType = {"username": "testbot", "perfs": {"correspondence": {"rating": 1500}}}
+    matchmaking = Matchmaking(mock_li, correspondence_matchmaking_config(max_active_games=1), user_profile)
+    matchmaking.min_wait_time = seconds(0)
+
+    assert matchmaking.challenge_correspondence([]) is False
+    mock_li.challenge.assert_not_called()

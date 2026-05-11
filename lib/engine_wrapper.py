@@ -139,7 +139,9 @@ class EngineWrapper:
                   is_correspondence: bool,
                   correspondence_move_time: datetime.timedelta,
                   engine_cfg: Configuration,
-                  min_time: datetime.timedelta) -> None:
+                  min_time: datetime.timedelta,
+                  search_should_stop: Callable[[], bool] | None = None,
+                  play_move_on_stop: bool = True) -> bool:
         """
         Play a move.
 
@@ -153,7 +155,9 @@ class EngineWrapper:
         :param correspondence_move_time: The time the engine will think if `is_correspondence` is true.
         :param engine_cfg: Options for external moves (e.g. from an opening book), and for engine resignation and draw offers.
         :param min_time: Minimum time to spend, in seconds.
-        :return: The move to play.
+        :param search_should_stop: Whether an interruptible search should be stopped early.
+        :param play_move_on_stop: Whether to play the best move found if the search was stopped early.
+        :return: Whether a move was played.
         """
         polyglot_cfg = engine_cfg.polyglot
         online_moves_cfg = engine_cfg.online_moves
@@ -184,7 +188,16 @@ class EngineWrapper:
                                                is_correspondence, correspondence_move_time)
 
             try:
-                best_move = self.search(board, time_limit, can_ponder, draw_offered, best_move)
+                if search_should_stop is None or not hasattr(self.engine, "analysis"):
+                    best_move = self.search(board, time_limit, can_ponder, draw_offered, best_move)
+                else:
+                    best_move, stopped = self.interruptible_search(board,
+                                                                   time_limit,
+                                                                   draw_offered,
+                                                                   best_move,
+                                                                   search_should_stop)
+                    if stopped and not play_move_on_stop:
+                        return False
             except chess.engine.EngineError as error:
                 BadMove = (chess.IllegalMoveError, chess.InvalidMoveError)
                 if not any(isinstance(e, BadMove) for e in error.args):
@@ -193,7 +206,7 @@ class EngineWrapper:
                 logger.error(error)
                 game_ender = li.abort if game.is_abortable() else li.resign
                 game_ender(game.id)
-                return
+                return False
 
         # Heed min_time
         elapsed = setup_timer.time_since_reset()
@@ -202,10 +215,13 @@ class EngineWrapper:
 
         self.add_comment(best_move, board)
         self.print_stats()
+        if best_move.move is None:
+            return False
         if best_move.resigned and len(board.move_stack) >= 2:
             li.resign(game.id)
         else:
             li.make_move(game.id, best_move)
+        return True
 
     def add_go_commands(self, time_limit: chess.engine.Limit) -> chess.engine.Limit:
         """Add extra commands to send to the engine. For example, to search for 1000 nodes or up to depth 10."""
@@ -272,6 +288,48 @@ class EngineWrapper:
         null_score = chess.engine.PovScore(chess.engine.Mate(1), board.turn)
         self.scores.append(result.info.get("score", null_score))
         return self.offer_draw_or_resign(result, board)
+
+    def interruptible_search(self,
+                             board: chess.Board,
+                             time_limit: chess.engine.Limit,
+                             draw_offered: bool,
+                             root_moves: MOVE,
+                             should_stop: Callable[[], bool]) -> tuple[chess.engine.PlayResult, bool]:
+        """
+        Search using an analysis handle so another queue condition can stop the engine cleanly.
+
+        This sends the engine's protocol-level stop command through python-chess and waits for the best move reported so
+        far. It is only used for correspondence slots where a waiting challenge may preempt the search.
+        """
+        time_limit = self.add_go_commands(time_limit)
+        root_move_list = root_moves if isinstance(root_moves, list) else None
+        analysis = self.engine.analysis(board, time_limit, info=chess.engine.INFO_ALL, root_moves=root_move_list)
+        stopped = False
+
+        try:
+            while True:
+                if should_stop():
+                    stopped = True
+                    analysis.stop()
+                    break
+
+                if analysis.would_block():
+                    time.sleep(0.1)
+                    continue
+
+                if analysis.next() is None:
+                    break
+
+            best = analysis.wait()
+        finally:
+            if stopped:
+                with contextlib.suppress(Exception):
+                    analysis.stop()
+
+        result = chess.engine.PlayResult(best.move, best.ponder, analysis.info.copy(), draw_offered=draw_offered)
+        null_score = chess.engine.PovScore(chess.engine.Mate(1), board.turn)
+        self.scores.append(result.info.get("score", null_score))
+        return self.offer_draw_or_resign(result, board), stopped
 
     def comment_index(self, move_stack_index: int) -> int:
         """

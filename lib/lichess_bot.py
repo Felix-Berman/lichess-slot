@@ -43,6 +43,7 @@ from collections import Counter
 from typing import TypedDict, cast, TypeAlias
 from types import FrameType
 MULTIPROCESSING_LIST_TYPE: TypeAlias = MutableSequence[model.Challenge]
+SLOT_ASSIGNMENTS_TYPE: TypeAlias = dict[str, str]
 POOL_TYPE: TypeAlias = Pool
 
 
@@ -58,6 +59,7 @@ class PlayGameArgsType(TypedDict, total=False):
     logging_queue: LOGGING_QUEUE_TYPE
     pgn_queue: PGN_QUEUE_TYPE
     game_id: str
+    slot_name: str | None
 
 
 class VersioningType(TypedDict):
@@ -354,6 +356,7 @@ def lichess_bot_main(li: lichess.Lichess,
                     for game in all_games
                     if game["gameId"] not in startup_correspondence_games}
     low_time_games: list[GameType] = []
+    slot_assignments: SLOT_ASSIGNMENTS_TYPE = {}
 
     last_check_online_time = Timer(hours(1))
     matchmaker = matchmaking.Matchmaking(li, config, user_profile)
@@ -386,14 +389,17 @@ def lichess_bot_main(li: lichess.Lichess,
 
             if event["type"] == "local_game_done":
                 active_games.discard(event["game"]["id"])
+                slot_name = slot_assignments.pop(event["game"]["id"], None)
                 matchmaker.game_done()
+                if not event["game"].get("correspondence"):
+                    matchmaker.slot_game_done(slot_name)
                 log_proc_count("Freed", active_games)
                 one_game_completed = True
             elif event["type"] == "challenge":
                 handle_challenge(event,
                                  li,
                                  challenge_queue,
-                                 config.challenge,
+                                 config,
                                  user_profile,
                                  recent_bot_challenges,
                                  online_block_list)
@@ -401,8 +407,12 @@ def lichess_bot_main(li: lichess.Lichess,
                 matchmaker.declined_challenge(event)
             elif event["type"] == "challengeCanceled":
                 active_games.discard(event["challenge"]["id"])
+                slot_assignments.pop(event["challenge"]["id"], None)
                 log_proc_count("Freed", active_games)
             elif event["type"] == "gameStart":
+                slot_name = matchmaker.slot_for_challenge(event["game"]["id"])
+                if slot_name:
+                    slot_assignments[event["game"]["id"]] = slot_name
                 matchmaker.accepted_challenge(event)
                 start_game(event,
                            pool,
@@ -411,18 +421,21 @@ def lichess_bot_main(li: lichess.Lichess,
                            startup_correspondence_games,
                            correspondence_queue,
                            active_games,
-                           low_time_games)
+                           low_time_games,
+                           slot_assignments)
 
-            start_low_time_games(low_time_games, active_games, max_games, pool, play_game_args)
+            start_low_time_games(low_time_games, active_games, max_games, pool, play_game_args, config, slot_assignments)
             check_in_on_correspondence_games(pool,
                                              event,
                                              correspondence_queue,
                                              challenge_queue,
                                              play_game_args,
                                              active_games,
-                                             max_games)
-            accept_challenges(li, challenge_queue, active_games, max_games)
-            matchmaker.challenge(active_games, challenge_queue, max_games)
+                                             max_games,
+                                             config,
+                                             slot_assignments)
+            accept_challenges(li, challenge_queue, active_games, max_games, config, slot_assignments)
+            matchmaker.challenge(active_games, challenge_queue, max_games, slot_assignments)
             check_online_status(li, user_profile, last_check_online_time)
 
             control_queue.task_done()
@@ -469,7 +482,9 @@ def check_in_on_correspondence_games(pool: POOL_TYPE,
                                      challenge_queue: MULTIPROCESSING_LIST_TYPE,
                                      play_game_args: PlayGameArgsType,
                                      active_games: set[str],
-                                     max_games: int) -> None:
+                                     max_games: int,
+                                     config: Configuration,
+                                     slot_assignments: SLOT_ASSIGNMENTS_TYPE) -> None:
     """Start correspondence games."""
     global correspondence_games_to_start
 
@@ -482,37 +497,134 @@ def check_in_on_correspondence_games(pool: POOL_TYPE,
         return
 
     while len(active_games) < max_games and correspondence_games_to_start > 0:
+        slot_name = None
+        if config.slots.enabled:
+            slot_name = choose_correspondence_slot(config, slot_assignments)
+            if slot_name is None:
+                return
         game_id = correspondence_queue.get_nowait()
         correspondence_games_to_start -= 1
         correspondence_queue.task_done()
-        start_game_thread(active_games, game_id, play_game_args, pool)
+        start_game_thread(active_games, game_id, play_game_args, pool, slot_assignments, slot_name)
 
 
-def start_low_time_games(low_time_games: list[GameType], active_games: set[str], max_games: int,
-                         pool: POOL_TYPE, play_game_args: PlayGameArgsType) -> None:
+def choose_correspondence_slot(config: Configuration, slot_assignments: SLOT_ASSIGNMENTS_TYPE) -> str | None:
+    """Choose an available slot that can spend compute on correspondence moves."""
+    for slot_name, raw_slot_config in config.slots.definitions.items():
+        slot_config = Configuration(raw_slot_config)
+        if not slot_config.allow_correspondence:
+            continue
+        slot_active = sum(assigned_slot == slot_name for assigned_slot in slot_assignments.values())
+        if slot_active < slot_config.concurrency:
+            return slot_name
+    return None
+
+
+def start_low_time_games(low_time_games: list[GameType],
+                         active_games: set[str],
+                         max_games: int,
+                         pool: POOL_TYPE,
+                         play_game_args: PlayGameArgsType,
+                         config: Configuration,
+                         slot_assignments: SLOT_ASSIGNMENTS_TYPE) -> None:
     """Start the games based on how much time we have left."""
     low_time_games.sort(key=lambda g: g.get("secondsLeft", math.inf))
     while low_time_games and len(active_games) < max_games:
+        slot_name = None
+        if config.slots.enabled:
+            slot_name = choose_correspondence_slot(config, slot_assignments)
+            if slot_name is None:
+                return
         game_id = low_time_games.pop(0)["id"]
-        start_game_thread(active_games, game_id, play_game_args, pool)
+        start_game_thread(active_games, game_id, play_game_args, pool, slot_assignments, slot_name)
 
 
-def accept_challenges(li: lichess.Lichess, challenge_queue: MULTIPROCESSING_LIST_TYPE, active_games: set[str],
-                      max_games: int) -> None:
+def accept_challenges(li: lichess.Lichess,
+                      challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                      active_games: set[str],
+                      max_games: int,
+                      config: Configuration,
+                      slot_assignments: SLOT_ASSIGNMENTS_TYPE | None = None) -> None:
     """Accept a challenge."""
-    while len(active_games) < max_games and challenge_queue:
-        chlng = challenge_queue.pop(0)
+    if not config.slots.enabled:
+        while len(active_games) < max_games and challenge_queue:
+            accept_next_challenge(li, challenge_queue, active_games)
+        return
+
+    if slot_assignments is None:
+        slot_assignments = {}
+    while challenge_queue:
+        challenge_index, slot_name = choose_queued_challenge_slot(config,
+                                                                  active_games,
+                                                                  challenge_queue,
+                                                                  slot_assignments,
+                                                                  max_games)
+        if slot_name is None:
+            return
+        accept_next_challenge(li, challenge_queue, active_games, slot_assignments, slot_name, challenge_index)
+
+
+def accept_next_challenge(li: lichess.Lichess,
+                          challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                          active_games: set[str],
+                          slot_assignments: SLOT_ASSIGNMENTS_TYPE | None = None,
+                          slot_name: str | None = None,
+                          challenge_index: int = 0) -> None:
+    """Accept the first challenge in the queue."""
+    if challenge_queue:
+        chlng = challenge_queue.pop(challenge_index)
         if chlng.from_self:
-            continue
+            return
 
         try:
             logger.info(f"Accept {chlng}")
             li.accept_challenge(chlng.id)
             active_games.add(chlng.id)
+            if slot_assignments is not None and slot_name is not None:
+                slot_assignments[chlng.id] = slot_name
             log_proc_count("Queued", active_games)
         except (HTTPError, ReadTimeout) as exception:
             if isinstance(exception, HTTPError) and exception.response is not None and exception.response.status_code == 404:
                 logger.info(f"Skip missing {chlng}")
+
+
+def choose_queued_challenge_slot(config: Configuration,
+                                 active_games: set[str],
+                                 challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                                 slot_assignments: SLOT_ASSIGNMENTS_TYPE,
+                                 max_games: int) -> tuple[int, str | None]:
+    """Choose a queued challenge and slot that can accept it now."""
+    for challenge_index, chlng in enumerate(challenge_queue):
+        slot_name = choose_slot_for_challenge(chlng, config, active_games, challenge_queue, slot_assignments, max_games)
+        if slot_name is not None:
+            return challenge_index, slot_name
+    return 0, None
+
+
+def choose_slot_for_challenge(chlng: model.Challenge,
+                              config: Configuration,
+                              active_games: set[str],
+                              challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                              slot_assignments: SLOT_ASSIGNMENTS_TYPE,
+                              max_games: int) -> str | None:
+    """Pick an available slot for an already-supported incoming challenge."""
+    if len(active_games) >= max_games:
+        return None
+
+    queued_slot_counts = Counter(getattr(challenge, "slot_name", "") for challenge in challenge_queue)
+    for slot_name, raw_slot_config in config.slots.definitions.items():
+        slot_config = Configuration(raw_slot_config)
+        slot_capacity = slot_config.concurrency
+        slot_active = sum(assigned_slot == slot_name for assigned_slot in slot_assignments.values())
+        slot_queued = queued_slot_counts[slot_name]
+        if slot_active + slot_queued >= slot_capacity:
+            continue
+
+        challenge_config = config.challenge | slot_config.challenge
+        if chlng.is_supported_time_control(challenge_config) and chlng.is_supported_variant(challenge_config):
+            return slot_name
+
+    return None
 
 
 def check_online_status(li: lichess.Lichess, user_profile: UserProfileType, last_check_online_time: Timer) -> None:
@@ -551,11 +663,19 @@ def game_is_active(li: lichess.Lichess, game_id: str) -> bool:
     return game_id in (ongoing_game["gameId"] for ongoing_game in active_games)
 
 
-def start_game_thread(active_games: set[str], game_id: str, play_game_args: PlayGameArgsType, pool: POOL_TYPE) -> None:
+def start_game_thread(active_games: set[str],
+                      game_id: str,
+                      play_game_args: PlayGameArgsType,
+                      pool: POOL_TYPE,
+                      slot_assignments: SLOT_ASSIGNMENTS_TYPE | None = None,
+                      slot_name: str | None = None) -> None:
     """Start a game thread."""
     active_games.add(game_id)
+    if slot_assignments is not None and slot_name is not None:
+        slot_assignments[game_id] = slot_name
     log_proc_count("Used", active_games)
     play_game_args["game_id"] = game_id
+    play_game_args["slot_name"] = slot_name
 
     def game_error_handler(error: BaseException) -> None:
         logger.exception("Game ended due to error:", exc_info=error)
@@ -579,7 +699,8 @@ def start_game(event: EventType,
                startup_correspondence_games: list[str],
                correspondence_queue: CORRESPONDENCE_QUEUE_TYPE,
                active_games: set[str],
-               low_time_games: list[GameType]) -> None:
+               low_time_games: list[GameType],
+               slot_assignments: SLOT_ASSIGNMENTS_TYPE) -> None:
     """
     Start a game.
 
@@ -593,7 +714,16 @@ def start_game(event: EventType,
     :param low_time_games: A list of games, in which we don't have much time remaining.
     """
     game_id = event["game"]["id"]
-    if game_id in startup_correspondence_games:
+    if event["game"].get("speed") == "correspondence" and game_id not in startup_correspondence_games:
+        active_games.discard(game_id)
+        slot_assignments.pop(game_id, None)
+        if enough_time_to_queue(event, config):
+            logger.info(f"--- Enqueue {config.url + game_id}")
+            correspondence_queue.put_nowait(game_id)
+        else:
+            logger.info(f"--- Will start {config.url + game_id} as soon as possible")
+            low_time_games.append(event["game"])
+    elif game_id in startup_correspondence_games:
         if enough_time_to_queue(event, config):
             logger.info(f"--- Enqueue {config.url + game_id}")
             correspondence_queue.put_nowait(game_id)
@@ -614,14 +744,26 @@ def enough_time_to_queue(event: EventType, config: Configuration) -> bool:
 
 
 def handle_challenge(event: EventType, li: lichess.Lichess, challenge_queue: MULTIPROCESSING_LIST_TYPE,
-                     challenge_config: Configuration, user_profile: UserProfileType,
+                     config: Configuration, user_profile: UserProfileType,
                      recent_bot_challenges: defaultdict[str, list[Timer]], online_block_list: OnlineBlocklist) -> None:
     """Handle incoming challenges. It either accepts, declines, or queues them to accept later."""
     chlng = model.Challenge(event["challenge"], user_profile)
     if chlng.from_self:
         return
 
+    challenge_config = supported_challenge_config(chlng, config)
+    if challenge_config is None:
+        li.decline_challenge(chlng.id, reason="timeControl")
+        return
+
     active_games = li.get_ongoing_games() or []
+    if chlng.speed == "correspondence":
+        active_correspondence_games = sum(game.get("speed") == "correspondence" for game in active_games)
+        queued_correspondence_challenges = sum(challenge.speed == "correspondence" for challenge in challenge_queue)
+        if active_correspondence_games + queued_correspondence_challenges >= config.correspondence.max_active_games:
+            li.decline_challenge(chlng.id, reason="later")
+            return
+
     opponent_engagements = Counter(game["opponent"]["username"] for game in active_games)
     opponent_engagements.update(challenge.challenger.name for challenge in challenge_queue)
 
@@ -642,10 +784,33 @@ def handle_challenge(event: EventType, li: lichess.Lichess, challenge_queue: MUL
         li.decline_challenge(chlng.id, reason=decline_reason)
 
 
+def supported_challenge_config(chlng: model.Challenge, config: Configuration) -> Configuration | None:
+    """Return the default or slot challenge config that supports an incoming challenge."""
+    if not config.slots.enabled:
+        return config.challenge
+
+    for slot_config in config.slots.definitions.config.values():
+        challenge_config = config.challenge | (slot_config.get("challenge") or {})
+        if chlng.is_supported_time_control(challenge_config) and chlng.is_supported_variant(challenge_config):
+            return challenge_config
+
+    return None
+
+
+def correspondence_interrupt_policy(config: Configuration, slot_name: str | None) -> str:
+    """Return how a slot should react to waiting challenges during a correspondence move."""
+    if not slot_name or not config.slots.enabled:
+        return "wait"
+
+    slot_config = config.slots.definitions.lookup(slot_name)
+    return slot_config.correspondence_interrupt if slot_config else "wait"
+
+
 @backoff.on_exception(backoff.expo, BaseException, max_time=600, giveup=lichess.is_final,  # type: ignore[arg-type]
                       on_backoff=lichess.backoff_handler)
 def play_game(li: lichess.Lichess,
               game_id: str,
+              slot_name: str | None,
               control_queue: CONTROL_QUEUE_TYPE,
               user_profile: UserProfileType,
               config: Configuration,
@@ -724,21 +889,36 @@ def play_game(li: lichess.Lichess,
                         takeback_field = game.state.get("btakeback") if game.is_white else game.state.get("wtakeback")
 
                         if not is_game_over(game) and is_engine_move(game, prior_game, board):
+                            interrupt_policy = correspondence_interrupt_policy(config, slot_name)
+                            if is_correspondence and challenge_queue and interrupt_policy == "stop_queue":
+                                logger.info(f"--- Requeue {game.url()} to accept a waiting challenge")
+                                stay_in_game = False
+                                continue
+                            stop_correspondence_search = (lambda: bool(challenge_queue)
+                                                          and correspondence_interrupt_policy(config, slot_name)
+                                                          in ["stop_move", "stop_queue"])
+                            play_move_on_stop = interrupt_policy == "stop_move"
                             disconnect_time = correspondence_disconnect_time
                             say_hello(conversation, hello, hello_spectators, board)
                             setup_timer = Timer()
                             print_move_number(board)
                             move_attempted = True
-                            engine.play_move(board,
-                                             game,
-                                             li,
-                                             setup_timer,
-                                             move_overhead,
-                                             can_ponder,
-                                             is_correspondence,
-                                             correspondence_move_time,
-                                             engine_cfg,
-                                             fake_think_time(config, board, game))
+                            move_played = engine.play_move(
+                                board,
+                                game,
+                                li,
+                                setup_timer,
+                                move_overhead,
+                                can_ponder,
+                                is_correspondence,
+                                correspondence_move_time,
+                                engine_cfg,
+                                fake_think_time(config, board, game),
+                                stop_correspondence_search if is_correspondence and interrupt_policy != "wait" else None,
+                                play_move_on_stop)
+                            if is_correspondence and not move_played:
+                                logger.info(f"--- Requeue {game.url()} after stopping correspondence search")
+                                stay_in_game = False
                             time.sleep(to_seconds(delay))
                         elif is_game_over(game):
                             tell_user_game_result(game, board)
@@ -924,7 +1104,9 @@ def final_queue_entries(control_queue: CONTROL_QUEUE_TYPE, correspondence_queue:
     else:
         logger.info(f"--- {game.url()} Game over")
 
-    control_queue.put_nowait({"type": "local_game_done", "game": {"id": game.id}})
+    control_queue.put_nowait({"type": "local_game_done",
+                              "game": {"id": game.id,
+                                       "correspondence": is_correspondence}})
     pgn_queue.put_nowait({"game": {"id": game.id,
                                    "pgn": pgn_record,
                                    "complete": is_game_over(game)}})

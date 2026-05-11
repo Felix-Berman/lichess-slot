@@ -131,6 +131,7 @@ correspondence:
   move_time: 60                    # Time in seconds to search in correspondence games.
   checkin_period: 300              # How often to check for opponent moves in correspondence games after disconnecting.
   disconnect_time: 150             # Time before disconnecting from a correspondence game.
+  max_active_games:                # Maximum correspondence games at once. Leave empty for no separate correspondence cap.
   ponder: false                    # Ponder in correspondence games the bot is connected to.
 
 challenge:                         # Incoming challenges.
@@ -202,14 +203,35 @@ matchmaking:
   allow_matchmaking: false         # Set it to 'true' to challenge other bots.
   allow_during_games: false        # Set it to 'true' to create challenges during long games.
   challenge_variant: "random"      # If set to 'random', the bot will choose one variant from the variants enabled in 'challenge.variants'.
-  challenge_timeout: 30            # Create a challenge after being idle for 'challenge_timeout' minutes. The minimum is 1 minute.
+  challenge_timeout: 30            # Minimum minutes between outgoing challenges. The minimum is 1 minute.
   challenge_initial_time:          # Initial time in seconds of the challenge (to be chosen at random).
     - 60
     - 180
   challenge_increment:             # Increment in seconds of the challenge (to be chosen at random).
     - 1
     - 2
-#  challenge_days:                 # Days for correspondence challenge (to be chosen at random).
+# challenge_time_controls:         # Optional paired real-time controls. If set, these are used instead of independently pairing challenge_initial_time and challenge_increment.
+#   - initial: 60
+#     increment: 0
+#   - initial: 180
+#     increment: 2
+# time_control_pools:              # Optional labelled pools of real-time controls. Labels are user-defined, not Lichess speed names.
+#   short:
+#     - initial: 60
+#       increment: 0
+#     - initial: 120
+#       increment: 1
+#   increment:
+#     challenge_initial_time:
+#       - 180
+#       - 300
+#     challenge_increment:
+#       - 2
+#       - 3
+# challenge_time_control_pools:    # Optional list of pool labels to use for this matchmaking config.
+#   - short
+#  challenge_days:                 # Days for correspondence challenges. With slots enabled, these are created by
+#                                  # a separate correspondence scheduler and do not occupy a slot until a move is due.
 #    - 1
 #    - 2
 # opponent_min_rating: 600         # Opponents rating should be above this value (600 is the minimum rating in lichess).
@@ -251,3 +273,39 @@ matchmaking:
 #     challenge_mode: casual
 #
 # The following configurations cannot be overridden: allow_matchmaking, challenge_timeout, challenge_filter and block_list.
+
+slots:
+  enabled: false                   # Set to true to use independent slots instead of the standard single concurrency pool.
+  definitions:                     # Each slot can override incoming challenge rules and outgoing matchmaking rules independently.
+#   bullet_slot:
+#     concurrency: 1
+#     challenge_timeout: 5         # Minutes after this slot finishes before it can create another outgoing challenge.
+#     allow_correspondence: false  # Whether this slot can spend idle compute on queued correspondence moves.
+#     correspondence_interrupt: wait # Options: wait, stop_move, stop_queue.
+#     challenge:                   # Incoming challenge overrides. Inherits the top-level challenge section.
+#       time_controls:
+#         - bullet
+#       max_base: 179
+#     matchmaking:                 # Outgoing challenge overrides. Inherits the top-level matchmaking section.
+#       allow_matchmaking: true
+#       challenge_time_control_pools:
+#         - short
+#   long_slot:
+#     concurrency: 1
+#     allow_correspondence: true
+#     challenge:
+#       time_controls:
+#         - rapid
+#         - classical
+#     matchmaking:
+#       allow_matchmaking: true
+#       challenge_time_control_pools:
+#         - increment
+#   human_slot:
+#     concurrency: 1
+#     allow_correspondence: true
+#     correspondence_interrupt: stop_move
+#     challenge:
+#       accept_bot: false
+#     matchmaking:
+#       allow_matchmaking: false

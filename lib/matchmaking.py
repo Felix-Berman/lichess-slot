@@ -9,9 +9,9 @@ from collections import defaultdict
 from collections.abc import Sequence
 from lib.lichess import Lichess, RateLimitedError
 from lib.config import Configuration
-from typing import cast, TypeAlias
+from typing import Any, cast, TypeAlias
 from lib.blocklist import OnlineBlocklist
-from lib.lichess_types import UserProfileType, PerfType, EventType, FilterType, ChallengeType
+from lib.lichess_types import UserProfileType, PerfType, EventType, FilterType, ChallengeType, GameType
 MULTIPROCESSING_LIST_TYPE: TypeAlias = Sequence[model.Challenge]
 
 logger = logging.getLogger(__name__)
@@ -25,12 +25,17 @@ class Matchmaking:
         self.li = li
         self.variants = list(filter(lambda variant: variant != "fromPosition", config.challenge.variants))
         self.matchmaking_cfg = config.matchmaking
+        self.correspondence_cfg = config.correspondence
+        self.slots_cfg = config.lookup("slots") or Configuration({"enabled": False, "definitions": {}})
         self.user_profile = user_profile
         self.last_challenge_created_delay = Timer(seconds(25))  # Challenges expire after 20 seconds.
         self.last_game_ended_delay = Timer(minutes(self.matchmaking_cfg.challenge_timeout))
         self.last_user_profile_update_time = Timer(minutes(5))
-        self.min_wait_time = seconds(60)  # Wait before new challenge to avoid api rate limits.
+        self.min_wait_time = minutes(self.matchmaking_cfg.challenge_timeout)
         self.rate_limit_timer = Timer()
+        self.slot_game_done_delays: dict[str, Timer] = {}
+        self.slot_challenge_ids: dict[str, str] = {}
+        self.correspondence_challenge_id = ""
 
         # Maximum time between challenges, even if there are active games
         self.max_wait_time = minutes(10) if self.matchmaking_cfg.allow_during_games else years(10)
@@ -62,6 +67,14 @@ class Matchmaking:
             self.discard_challenge(self.challenge_id)
             self.show_earliest_challenge_time()
         return bool(matchmaking_enabled and (time_has_passed or challenge_expired) and min_wait_time_passed)
+
+    def should_create_slot_challenge(self) -> bool:
+        """Whether a matchmaking slot may create a challenge."""
+        matchmaking_enabled = self.matchmaking_cfg.allow_matchmaking
+        min_wait_time_passed = self.last_challenge_created_delay.time_since_reset() > self.min_wait_time
+        return bool(matchmaking_enabled
+                    and self.rate_limit_timer.is_expired()
+                    and min_wait_time_passed)
 
     def create_challenge(self, username: str, base_time: int, increment: int, days: int, variant: str,
                          mode: str) -> str:
@@ -144,27 +157,23 @@ class Matchmaking:
             weights = [1] * len(online_bots)
         return weights
 
-    def choose_opponent(self) -> tuple[str | None, int, int, int, str, str]:
-        """Choose an opponent."""
+    def choose_matchmaking_config(self) -> tuple[str, Configuration]:
+        """Choose the matchmaking configuration to use for one outgoing challenge."""
         override_choice = random.choice(self.matchmaking_cfg.overrides.keys() + [None])
         logger.info(f"Using the {override_choice or 'default'} matchmaking configuration.")
         override = {} if override_choice is None else self.matchmaking_cfg.overrides.lookup(override_choice)
-        match_config = self.matchmaking_cfg | override
+        return override_choice or "default", self.matchmaking_cfg | override
+
+    def choose_opponent(self, match_config: Configuration | None = None) -> tuple[str | None, int, int, int, str, str]:
+        """Choose an opponent."""
+        if match_config is None:
+            _, match_config = self.choose_matchmaking_config()
 
         variant = self.get_random_config_value(match_config, "challenge_variant", self.variants)
         mode = self.get_random_config_value(match_config, "challenge_mode", ["casual", "rated"])
         rating_preference = match_config.rating_preference
 
-        base_time = random.choice(match_config.challenge_initial_time)
-        increment = random.choice(match_config.challenge_increment)
-        num_days = random.choice(match_config.challenge_days)
-
-        play_correspondence = [bool(num_days), not bool(base_time or increment)]
-        if random.choice(play_correspondence):
-            base_time = 0
-            increment = 0
-        else:
-            num_days = 0
+        base_time, increment, num_days = choose_time_control(match_config)
 
         game_type = game_category(variant, base_time, increment, num_days)
 
@@ -217,7 +226,11 @@ class Matchmaking:
         value: str = config.lookup(parameter)
         return value if value != "random" else random.choice(choices)
 
-    def challenge(self, active_games: set[str], challenge_queue: MULTIPROCESSING_LIST_TYPE, max_games: int) -> None:
+    def challenge(self,
+                  active_games: set[str],
+                  challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                  max_games: int,
+                  slot_assignments: dict[str, str] | None = None) -> None:
         """
         Challenge an opponent.
 
@@ -225,6 +238,12 @@ class Matchmaking:
         :param challenge_queue: The queue containing the challenges.
         :param max_games: The maximum allowed number of simultaneous games.
         """
+        if self.slots_cfg.enabled:
+            challenge_created = self.challenge_slots(active_games, challenge_queue, max_games, slot_assignments or {})
+            if not challenge_created:
+                self.challenge_correspondence(challenge_queue)
+            return
+
         max_games_for_matchmaking = max_games if self.matchmaking_cfg.allow_during_games else min(1, max_games)
         game_count = len(active_games) + len(challenge_queue)
         if (game_count >= max_games_for_matchmaking
@@ -240,6 +259,119 @@ class Matchmaking:
         logger.info(f"Challenge id is {challenge_id or 'None'}.")
         self.challenge_id = challenge_id
 
+    def challenge_slots(self,
+                        active_games: set[str],
+                        challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                        max_games: int,
+                        slot_assignments: dict[str, str]) -> bool:
+        """Challenge opponents using independently throttled matchmaking slots."""
+        slots = self.slots_cfg.definitions
+        if not slots:
+            logger.warning("slots.enabled is true, but no slots are configured.")
+            return False
+
+        global_capacity = max_games if self.matchmaking_cfg.allow_during_games else min(1, max_games)
+        if len(active_games) + len(challenge_queue) >= global_capacity:
+            return False
+
+        for slot_name in slots.keys():
+            if self.challenge_slot(slot_name,
+                                   slots.lookup(slot_name),
+                                   active_games,
+                                   challenge_queue,
+                                   global_capacity,
+                                   slot_assignments):
+                return True
+        return False
+
+    def challenge_slot(self, slot_name: str, slot_config: Configuration, active_games: set[str],
+                       challenge_queue: MULTIPROCESSING_LIST_TYPE, global_capacity: int,
+                       slot_assignments: dict[str, str]) -> bool:
+        """Try to create one challenge for a slot."""
+        challenge_id = self.slot_challenge_ids.get(slot_name, "")
+        if challenge_id and self.last_challenge_created_delay.is_expired():
+            self.li.cancel(challenge_id)
+            logger.info(f"Challenge id {challenge_id} cancelled.")
+            self.slot_challenge_ids[slot_name] = ""
+            challenge_id = ""
+
+        if challenge_id:
+            return False
+
+        if not slot_config.matchmaking.allow_matchmaking:
+            return False
+
+        slot_delay = self.slot_game_done_delays.get(slot_name)
+        occupied_slots = len(active_games) + len(challenge_queue) + sum(bool(challenge_id)
+                                                                       for challenge_id in self.slot_challenge_ids.values())
+        slot_occupied = (sum(assigned_slot == slot_name for assigned_slot in slot_assignments.values())
+                         + sum(bool(challenge_id) for challenge_id_slot, challenge_id in self.slot_challenge_ids.items()
+                               if challenge_id_slot == slot_name))
+        if (occupied_slots >= global_capacity
+                or slot_occupied >= slot_config.concurrency
+                or (slot_delay is not None and not slot_delay.is_expired())
+                or not self.should_create_slot_challenge()):
+            return False
+
+        logger.info(f"Challenging a random bot for slot {slot_name}")
+        self.update_user_profile()
+        match_config = slot_config.matchmaking
+        bot_username, base_time, increment, days, variant, mode = self.choose_opponent(match_config)
+        logger.info(f"Will challenge {bot_username} for a {variant} game in slot {slot_name}.")
+        new_challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode) if bot_username else ""
+        logger.info(f"Challenge id is {new_challenge_id or 'None'}.")
+        self.slot_challenge_ids[slot_name] = new_challenge_id
+        return bool(new_challenge_id)
+
+    def challenge_correspondence(self, challenge_queue: MULTIPROCESSING_LIST_TYPE) -> bool:
+        """Create a correspondence challenge without occupying a compute slot."""
+        if challenge_queue:
+            return False
+
+        challenge_id = self.correspondence_challenge_id
+        if challenge_id and self.last_challenge_created_delay.is_expired():
+            self.li.cancel(challenge_id)
+            logger.info(f"Challenge id {challenge_id} cancelled.")
+            self.discard_challenge(challenge_id)
+
+        if self.correspondence_challenge_id:
+            return False
+
+        if not configured_correspondence_days(self.matchmaking_cfg):
+            return False
+
+        if (self.correspondence_game_count(challenge_queue) >= self.correspondence_cfg.max_active_games
+                or not self.should_create_slot_challenge()):
+            return False
+
+        logger.info("Challenging a random bot for a correspondence game")
+        self.update_user_profile()
+        match_config = self.correspondence_matchmaking_config()
+        bot_username, base_time, increment, days, variant, mode = self.choose_opponent(match_config)
+        logger.info(f"Will challenge {bot_username} for a {variant} correspondence game.")
+        new_challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode) if bot_username else ""
+        logger.info(f"Challenge id is {new_challenge_id or 'None'}.")
+        self.correspondence_challenge_id = new_challenge_id
+        return bool(new_challenge_id)
+
+    def correspondence_matchmaking_config(self) -> Configuration:
+        """Return a matchmaking config constrained to correspondence time controls."""
+        config = self.matchmaking_cfg.config | {
+            "challenge_initial_time": [None],
+            "challenge_increment": [None],
+            "challenge_time_controls": [],
+            "challenge_time_control_pools": [],
+        }
+        return Configuration(config)
+
+    def correspondence_game_count(self, challenge_queue: MULTIPROCESSING_LIST_TYPE) -> int:
+        """Count current and queued correspondence games/challenges."""
+        active_games: list[GameType] = self.li.get_ongoing_games() or []
+        active_correspondence_games = sum(game.get("speed") == "correspondence" for game in active_games)
+        queued_correspondence_challenges = sum(challenge.speed == "correspondence" for challenge in challenge_queue)
+        pending_correspondence_challenge = 1 if self.correspondence_challenge_id else 0
+        return active_correspondence_games + queued_correspondence_challenges + pending_correspondence_challenge
+
     def discard_challenge(self, challenge_id: str) -> None:
         """
         Clear the ID of the most recent challenge if it is no longer needed.
@@ -248,11 +380,30 @@ class Matchmaking:
         """
         if self.challenge_id == challenge_id:
             self.challenge_id = ""
+        if self.correspondence_challenge_id == challenge_id:
+            self.correspondence_challenge_id = ""
+        for slot_name, slot_challenge_id in list(self.slot_challenge_ids.items()):
+            if slot_challenge_id == challenge_id:
+                self.slot_challenge_ids[slot_name] = ""
+
+    def slot_for_challenge(self, challenge_id: str) -> str | None:
+        """Return the slot that created a pending outgoing challenge."""
+        for slot_name, slot_challenge_id in self.slot_challenge_ids.items():
+            if slot_challenge_id == challenge_id:
+                return slot_name
+        return None
 
     def game_done(self) -> None:
         """Reset the timer for when the last game ended, and prints the earliest that the next challenge will be created."""
         self.last_game_ended_delay.reset()
         self.show_earliest_challenge_time()
+
+    def slot_game_done(self, slot_name: str | None) -> None:
+        """Reset the per-slot timer when a slot finishes using compute."""
+        if slot_name is not None:
+            slot_config = self.slots_cfg.definitions.lookup(slot_name)
+            slot_timeout = slot_config.challenge_timeout if slot_config else self.matchmaking_cfg.challenge_timeout
+            self.slot_game_done_delays[slot_name] = Timer(minutes(slot_timeout))
 
     def show_earliest_challenge_time(self) -> None:
         """Show the earliest that the next challenge will be created."""
@@ -359,3 +510,100 @@ def game_category(variant: str, base_time: int, increment: int, num_days: int) -
     if game_duration < 1499:
         return "rapid"
     return "classical"
+
+
+def choose_time_control(match_config: Configuration) -> tuple[int, int, int]:
+    """Choose a time control from labelled pools, paired controls, or legacy matchmaking config."""
+    real_time_controls = configured_real_time_controls(match_config)
+    correspondence_days = configured_correspondence_days(match_config)
+
+    choices: list[str] = []
+    choices.extend(["clock"] * len(real_time_controls))
+    choices.extend(["correspondence"] * len(correspondence_days))
+    if not choices:
+        return 0, 0, 0
+
+    if random.choice(choices) == "correspondence":
+        return 0, 0, random.choice(correspondence_days)
+
+    base_time, increment = random.choice(real_time_controls)
+    return base_time, increment, 0
+
+
+def configured_real_time_controls(match_config: Configuration) -> list[tuple[int, int]]:
+    """Return valid real-time controls as explicit (initial, increment) pairs."""
+    time_controls: list[tuple[int, int]] = []
+    time_controls.extend(configured_pool_time_controls(match_config))
+
+    for entry in match_config.lookup("challenge_time_controls") or []:
+        time_control = normalize_time_control(entry)
+        if time_control:
+            time_controls.append(time_control)
+
+    if time_controls:
+        return time_controls
+
+    initial_times = [initial_time for initial_time in match_config.challenge_initial_time or [] if initial_time is not None]
+    increments = [increment for increment in match_config.challenge_increment or [] if increment is not None]
+    return [(initial_time, increment) for initial_time in initial_times for increment in increments]
+
+
+def configured_pool_time_controls(match_config: Configuration) -> list[tuple[int, int]]:
+    """Return explicit controls from selected labelled time-control pools."""
+    time_control_pools = match_config.lookup("time_control_pools")
+    if not isinstance(time_control_pools, Configuration):
+        return []
+
+    time_controls: list[tuple[int, int]] = []
+    for pool_name in match_config.lookup("challenge_time_control_pools") or []:
+        pool = time_control_pools.lookup(pool_name)
+        time_controls.extend(normalize_time_control_pool(pool))
+    return time_controls
+
+
+def normalize_time_control_pool(pool: Any) -> list[tuple[int, int]]:
+    """Normalize one labelled time-control pool."""
+    if isinstance(pool, Configuration):
+        pool = pool.config
+
+    if isinstance(pool, dict):
+        explicit_controls = pool.get("challenge_time_controls", pool.get("time_controls"))
+        if explicit_controls:
+            return list(filter(None, (normalize_time_control(entry) for entry in explicit_controls)))
+
+        initial_times = pool.get("challenge_initial_time", pool.get("initial_time", pool.get("initial", []))) or []
+        increments = pool.get("challenge_increment", pool.get("increment", [])) or []
+        if not isinstance(initial_times, list):
+            initial_times = [initial_times]
+        if not isinstance(increments, list):
+            increments = [increments]
+        return [(int(initial_time), int(increment))
+                for initial_time in initial_times
+                for increment in increments
+                if initial_time is not None and increment is not None]
+
+    if isinstance(pool, list):
+        return list(filter(None, (normalize_time_control(entry) for entry in pool)))
+
+    return []
+
+
+def configured_correspondence_days(match_config: Configuration) -> list[int]:
+    """Return configured correspondence days."""
+    return [days for days in match_config.challenge_days or [] if days is not None]
+
+
+def normalize_time_control(entry: Any) -> tuple[int, int] | None:
+    """Normalize a time control configured as a dict or a two-item list."""
+    if isinstance(entry, dict):
+        initial = entry.get("initial", entry.get("base"))
+        increment = entry.get("increment")
+    elif isinstance(entry, list | tuple) and len(entry) == 2:
+        initial, increment = entry
+    else:
+        return None
+
+    if initial is None or increment is None:
+        return None
+
+    return int(initial), int(increment)
