@@ -1,8 +1,8 @@
 """Test functions for matchmaking module."""
 from unittest.mock import Mock
 from lib.matchmaking import configured_real_time_controls, choose_time_control, game_category, Matchmaking
-from lib.config import Configuration
-from lib.timer import seconds
+from lib.config import Configuration, insert_default_values
+from lib.timer import seconds, minutes
 from lib.lichess_types import UserProfileType
 
 
@@ -375,3 +375,52 @@ def test_challenge_correspondence__respects_correspondence_cap() -> None:
 
     assert matchmaking.challenge_correspondence([]) is False
     mock_li.challenge.assert_not_called()
+
+
+def test_challenge_slots__throttles_failed_opponent_search() -> None:
+    """Test empty opponent searches consume the outgoing matchmaking cooldown."""
+    mock_li = Mock()
+    mock_li.get_online_bots.return_value = []
+    user_profile: UserProfileType = {"username": "testbot", "perfs": {"bullet": {"rating": 1500}}}
+    config_dict = {
+        "challenge": {"variants": ["standard"]},
+        "correspondence": {"max_active_games": 3},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "challenge_timeout": 1,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_initial_time": [60],
+            "challenge_increment": [0],
+            "challenge_days": [],
+            "opponent_rating_difference": None,
+        },
+        "slots": {
+            "enabled": True,
+            "definitions": {
+                "short": {
+                    "matchmaking": {
+                        "challenge_initial_time": [60],
+                        "challenge_increment": [0],
+                        "challenge_days": [],
+                    },
+                },
+                "long": {
+                    "matchmaking": {
+                        "challenge_initial_time": [60],
+                        "challenge_increment": [0],
+                        "challenge_days": [],
+                    },
+                },
+            },
+        },
+    }
+    insert_default_values(config_dict)
+    matchmaking = Matchmaking(mock_li, Configuration(config_dict), user_profile)
+    matchmaking.last_challenge_created_delay.starting_time -= minutes(2).total_seconds()
+
+    assert matchmaking.challenge_slots(set(), [], 3, {}) is False
+    mock_li.get_online_bots.assert_called_once()
+    mock_li.challenge.assert_not_called()
+    assert not matchmaking.should_create_slot_challenge()

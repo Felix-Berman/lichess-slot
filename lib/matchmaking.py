@@ -120,6 +120,10 @@ class Matchmaking:
             self.add_challenge_filter(username, "")
         self.show_earliest_challenge_time()
 
+    def record_matchmaking_attempt(self) -> None:
+        """Throttle outgoing matchmaking attempts, even when no opponent is available."""
+        self.last_challenge_created_delay.reset()
+
     def perf(self) -> dict[str, PerfType]:
         """Get the bot's rating in every variant. Bullet, blitz, rapid etc. are considered different variants."""
         user_perf: dict[str, PerfType] = self.user_profile["perfs"]
@@ -252,6 +256,7 @@ class Matchmaking:
             return
 
         logger.info("Challenging a random bot")
+        self.record_matchmaking_attempt()
         self.update_user_profile()
         bot_username, base_time, increment, days, variant, mode = self.choose_opponent()
         logger.info(f"Will challenge {bot_username} for a {variant} game.")
@@ -314,6 +319,7 @@ class Matchmaking:
             return False
 
         logger.info(f"Challenging a random bot for slot {slot_name}")
+        self.record_matchmaking_attempt()
         self.update_user_profile()
         match_config = slot_config.matchmaking
         bot_username, base_time, increment, days, variant, mode = self.choose_opponent(match_config)
@@ -345,6 +351,7 @@ class Matchmaking:
             return False
 
         logger.info("Challenging a random bot for a correspondence game")
+        self.record_matchmaking_attempt()
         self.update_user_profile()
         match_config = self.correspondence_matchmaking_config()
         bot_username, base_time, increment, days, variant, mode = self.choose_opponent(match_config)
