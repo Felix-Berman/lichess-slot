@@ -10,6 +10,7 @@ import traceback
 from collections import defaultdict
 import datetime
 import contextlib
+from email.utils import parsedate_to_datetime
 from lib.timer import Timer, seconds, sec_str
 from typing import cast
 import chess.engine
@@ -90,16 +91,43 @@ def is_opponent_rate_limit(response: requests.models.Response) -> bool:
 
 def is_bot_rate_limit(response: requests.models.Response) -> bool:
     """Check if response to a challenge is 429, which means the bot is rate limited."""
-    return is_daily_game_rate_limit(response, 429)
+    return is_new_rate_limit(response)
 
 
-def get_challenge_timeout(challenge_response: ChallengeType) -> datetime.timedelta | None:
+def get_retry_after_timeout(response: requests.models.Response) -> datetime.timedelta | None:
+    """Return the timeout from a Retry-After header, if one is present."""
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        return None
+
+    try:
+        return seconds(max(0.0, float(retry_after)))
+    except ValueError:
+        pass
+
+    try:
+        retry_after_date = parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+    if retry_after_date.tzinfo is None:
+        retry_after_date = retry_after_date.replace(tzinfo=datetime.timezone.utc)
+
+    return max(datetime.timedelta(), retry_after_date - datetime.datetime.now(datetime.timezone.utc))
+
+
+def get_challenge_timeout(challenge_response: ChallengeType,
+                          response: requests.models.Response | None = None) -> datetime.timedelta | None:
     """Return the timeout in a challenge response if the bot or the opponent cannot play another game."""
     rate_limit = challenge_response.get("ratelimit", {})
     key = rate_limit.get("key", "")
     if key == "bot.vsBot.day":
         return seconds(float(rate_limit["seconds"]))
-    return None
+    if response is not None:
+        retry_after_timeout = get_retry_after_timeout(response)
+        if retry_after_timeout is not None:
+            return retry_after_timeout
+    return seconds(60)
 
 
 def is_final(exception: Exception) -> bool:
@@ -302,7 +330,7 @@ class Lichess:
         opponent_is_rate_limited = is_opponent_rate_limit(response)
         challenge_response: ChallengeType = response.json()
         if bot_is_rate_limited or opponent_is_rate_limited:
-            delay = cast(datetime.timedelta, get_challenge_timeout(challenge_response))
+            delay = cast(datetime.timedelta, get_challenge_timeout(challenge_response, response))
             if bot_is_rate_limited:
                 self.set_rate_limit_delay(ENDPOINTS["challenge"], delay)
             challenge_response["bot_is_rate_limited"] = bot_is_rate_limited

@@ -1,5 +1,7 @@
 """Test functions for matchmaking module."""
+import logging
 from unittest.mock import Mock
+from lib import lichess
 from lib.matchmaking import configured_real_time_controls, choose_time_control, game_category, Matchmaking
 from lib.config import Configuration, insert_default_values
 from lib.timer import seconds, minutes
@@ -377,7 +379,7 @@ def test_challenge_correspondence__respects_correspondence_cap() -> None:
     mock_li.challenge.assert_not_called()
 
 
-def test_challenge_slots__throttles_failed_opponent_search() -> None:
+def test_challenge_slots__throttles_failed_opponent_search(caplog) -> None:  # noqa: ANN001
     """Test empty opponent searches consume the outgoing matchmaking cooldown."""
     mock_li = Mock()
     mock_li.get_online_bots.return_value = []
@@ -420,7 +422,113 @@ def test_challenge_slots__throttles_failed_opponent_search() -> None:
     matchmaking = Matchmaking(mock_li, Configuration(config_dict), user_profile)
     matchmaking.last_challenge_created_delay.starting_time -= minutes(2).total_seconds()
 
-    assert matchmaking.challenge_slots(set(), [], 3, {}) is False
+    with caplog.at_level(logging.INFO, logger="lib.matchmaking"):
+        assert matchmaking.challenge_slots(set(), [], 3, {}) is False
+
     mock_li.get_online_bots.assert_called_once()
     mock_li.challenge.assert_not_called()
     assert not matchmaking.should_create_slot_challenge()
+    assert "Will challenge None" not in caplog.text
+    assert "Challenge id is None" not in caplog.text
+
+
+def test_challenge_slots__respects_active_game_pacing() -> None:
+    """Test slot matchmaking keeps the pre-slot active-game challenge cadence."""
+    mock_li = Mock()
+    mock_li.get_online_bots.return_value = [
+        {"username": "otherbot", "perfs": {"bullet": {"games": 1, "rating": 1500}}},
+    ]
+    user_profile: UserProfileType = {"username": "testbot", "perfs": {"bullet": {"rating": 1500}}}
+    config_dict = {
+        "challenge": {"variants": ["standard"]},
+        "correspondence": {"max_active_games": 3},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "challenge_timeout": 1,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_initial_time": [60],
+            "challenge_increment": [0],
+            "challenge_days": [],
+            "opponent_rating_difference": None,
+        },
+        "slots": {
+            "enabled": True,
+            "definitions": {
+                "short": {
+                    "matchmaking": {
+                        "challenge_initial_time": [60],
+                        "challenge_increment": [0],
+                        "challenge_days": [],
+                    },
+                },
+            },
+        },
+    }
+    insert_default_values(config_dict)
+    matchmaking = Matchmaking(mock_li, Configuration(config_dict), user_profile)
+    matchmaking.last_challenge_created_delay.starting_time -= minutes(2).total_seconds()
+
+    assert matchmaking.challenge_slots({"active-game"}, [], 3, {}) is False
+    mock_li.get_online_bots.assert_not_called()
+    mock_li.challenge.assert_not_called()
+
+
+def test_handle_challenge_error_response__generic_429_filters_opponent() -> None:
+    """Test generic 429 challenge failures still avoid immediately retrying that opponent."""
+    mock_li = Mock()
+    user_profile: UserProfileType = {"username": "testbot", "perfs": {"bullet": {"rating": 1500}}}
+    config_dict = {
+        "challenge": {"variants": ["standard"]},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "challenge_timeout": 1,
+            "challenge_filter": "coarse",
+        },
+    }
+    insert_default_values(config_dict)
+    matchmaking = Matchmaking(mock_li, Configuration(config_dict), user_profile)
+
+    matchmaking.handle_challenge_error_response({
+        "error": "Too many requests. Try again later.",
+        "bot_is_rate_limited": True,
+        "opponent_is_rate_limited": False,
+        "rate_limit_timeout": seconds(60),
+    }, "simpleEval")
+
+    assert not matchmaking.rate_limit_timer.is_expired()
+    assert not matchmaking.should_accept_challenge("simpleEval", "")
+
+
+def test_choose_opponent__reports_online_bots_rate_limit(caplog) -> None:  # noqa: ANN001
+    """Test rate-limited bot discovery is reported instead of logged as no suitable bots."""
+    mock_li = Mock()
+    mock_li.is_rate_limited.return_value = True
+    mock_li.rate_limit_time_left.return_value = seconds(60)
+    user_profile: UserProfileType = {"username": "testbot", "perfs": {"bullet": {"rating": 1500}}}
+    config_dict = {
+        "challenge": {"variants": ["standard"]},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "challenge_timeout": 1,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_initial_time": [60],
+            "challenge_increment": [0],
+            "challenge_days": [],
+            "opponent_rating_difference": None,
+        },
+    }
+    insert_default_values(config_dict)
+    matchmaking = Matchmaking(mock_li, Configuration(config_dict), user_profile)
+
+    with caplog.at_level(logging.ERROR, logger="lib.matchmaking"):
+        bot_username, *_ = matchmaking.choose_opponent()
+
+    assert bot_username is None
+    mock_li.is_rate_limited.assert_called_with(lichess.ENDPOINTS["online_bots"])
+    mock_li.get_online_bots.assert_not_called()
+    assert not matchmaking.rate_limit_timer.is_expired()
+    assert "'bot_is_rate_limited': True" in caplog.text
+    assert "No suitable bots found" not in caplog.text

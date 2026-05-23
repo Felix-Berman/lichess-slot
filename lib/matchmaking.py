@@ -7,7 +7,7 @@ from lib import model
 from lib.timer import Timer, days, seconds, minutes, years
 from collections import defaultdict
 from collections.abc import Sequence
-from lib.lichess import Lichess, RateLimitedError
+from lib.lichess import ENDPOINTS, Lichess, RateLimitedError
 from lib.config import Configuration
 from typing import Any, cast, TypeAlias
 from lib.blocklist import OnlineBlocklist
@@ -68,12 +68,15 @@ class Matchmaking:
             self.show_earliest_challenge_time()
         return bool(matchmaking_enabled and (time_has_passed or challenge_expired) and min_wait_time_passed)
 
-    def should_create_slot_challenge(self) -> bool:
+    def should_create_slot_challenge(self, game_count: int = 0) -> bool:
         """Whether a matchmaking slot may create a challenge."""
         matchmaking_enabled = self.matchmaking_cfg.allow_matchmaking
         min_wait_time_passed = self.last_challenge_created_delay.time_since_reset() > self.min_wait_time
+        active_game_wait_passed = (game_count == 0
+                                   or self.last_challenge_created_delay.time_since_reset() >= self.max_wait_time)
         return bool(matchmaking_enabled
                     and self.rate_limit_timer.is_expired()
+                    and active_game_wait_passed
                     and min_wait_time_passed)
 
     def create_challenge(self, username: str, base_time: int, increment: int, days: int, variant: str,
@@ -99,8 +102,7 @@ class Matchmaking:
                 self.handle_challenge_error_response(response, username)
             return challenge_id
         except RateLimitedError as e:
-            logger.warning(e)
-            self.rate_limit_timer = Timer(e.timeout)
+            self.report_bot_rate_limit(str(e), e.timeout)
         except Exception as e:
             logger.debug(e, exc_info=e)
 
@@ -114,11 +116,35 @@ class Matchmaking:
         if response.get("bot_is_rate_limited"):
             timeout = cast(datetime.timedelta, response.get("rate_limit_timeout"))
             self.rate_limit_timer = Timer(timeout)
+            if not response.get("ratelimit"):
+                self.add_challenge_filter(username, "")
         elif response.get("opponent_is_rate_limited"):
             self.add_challenge_filter(username, "", response.get("rate_limit_timeout"))
         else:
             self.add_challenge_filter(username, "")
         self.show_earliest_challenge_time()
+
+    def report_bot_rate_limit(self, error: str, timeout: datetime.timedelta) -> None:
+        """Report that our bot is rate limited and pause outgoing matchmaking."""
+        response: ChallengeType = {
+            "error": error,
+            "bot_is_rate_limited": True,
+            "opponent_is_rate_limited": False,
+            "rate_limit_timeout": timeout,
+        }
+        logger.error(response)
+        self.rate_limit_timer = Timer(timeout)
+        self.show_earliest_challenge_time()
+
+    def report_endpoint_rate_limit(self, endpoint_name: str) -> bool:
+        """Report an existing Lichess endpoint cooldown if it blocks matchmaking."""
+        path_template = ENDPOINTS[endpoint_name]
+        if self.li.is_rate_limited(path_template) is not True:
+            return False
+
+        timeout = self.li.rate_limit_time_left(path_template)
+        self.report_bot_rate_limit(f"Endpoint {path_template} is rate limited. Try again later.", timeout)
+        return True
 
     def record_matchmaking_attempt(self) -> None:
         """Throttle outgoing matchmaking attempts, even when no opponent is available."""
@@ -198,7 +224,11 @@ class Matchmaking:
                     and min_rating <= perf.get("rating", 0) <= max_rating)
 
         self.online_block_list.refresh()
+        if self.report_endpoint_rate_limit("online_bots"):
+            return None, base_time, increment, num_days, variant, mode
         online_bots = self.li.get_online_bots()
+        if self.report_endpoint_rate_limit("online_bots"):
+            return None, base_time, increment, num_days, variant, mode
         online_bots = list(filter(is_suitable_opponent, online_bots))
 
         def ready_for_challenge(bot: UserProfileType) -> bool:
@@ -218,7 +248,9 @@ class Matchmaking:
             else:
                 bot_username = bot["username"]
         except Exception:
-            if online_bots:
+            if self.report_endpoint_rate_limit("public_data"):
+                pass
+            elif online_bots:
                 logger.exception("Error:")
             else:
                 logger.error("No suitable bots found to challenge.")
@@ -245,7 +277,7 @@ class Matchmaking:
         if self.slots_cfg.enabled:
             challenge_created = self.challenge_slots(active_games, challenge_queue, max_games, slot_assignments or {})
             if not challenge_created:
-                self.challenge_correspondence(challenge_queue)
+                self.challenge_correspondence(challenge_queue, active_games)
             return
 
         max_games_for_matchmaking = max_games if self.matchmaking_cfg.allow_during_games else min(1, max_games)
@@ -259,8 +291,11 @@ class Matchmaking:
         self.record_matchmaking_attempt()
         self.update_user_profile()
         bot_username, base_time, increment, days, variant, mode = self.choose_opponent()
+        if not bot_username:
+            return
+
         logger.info(f"Will challenge {bot_username} for a {variant} game.")
-        challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode) if bot_username else ""
+        challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode)
         logger.info(f"Challenge id is {challenge_id or 'None'}.")
         self.challenge_id = challenge_id
 
@@ -315,7 +350,7 @@ class Matchmaking:
         if (occupied_slots >= global_capacity
                 or slot_occupied >= slot_config.concurrency
                 or (slot_delay is not None and not slot_delay.is_expired())
-                or not self.should_create_slot_challenge()):
+                or not self.should_create_slot_challenge(len(active_games) + len(challenge_queue))):
             return False
 
         logger.info(f"Challenging a random bot for slot {slot_name}")
@@ -323,13 +358,18 @@ class Matchmaking:
         self.update_user_profile()
         match_config = slot_config.matchmaking
         bot_username, base_time, increment, days, variant, mode = self.choose_opponent(match_config)
+        if not bot_username:
+            return False
+
         logger.info(f"Will challenge {bot_username} for a {variant} game in slot {slot_name}.")
-        new_challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode) if bot_username else ""
+        new_challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode)
         logger.info(f"Challenge id is {new_challenge_id or 'None'}.")
         self.slot_challenge_ids[slot_name] = new_challenge_id
         return bool(new_challenge_id)
 
-    def challenge_correspondence(self, challenge_queue: MULTIPROCESSING_LIST_TYPE) -> bool:
+    def challenge_correspondence(self,
+                                 challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                                 active_games: set[str] | None = None) -> bool:
         """Create a correspondence challenge without occupying a compute slot."""
         if challenge_queue:
             return False
@@ -346,8 +386,10 @@ class Matchmaking:
         if not configured_correspondence_days(self.matchmaking_cfg):
             return False
 
+        active_game_count = len(active_games) if active_games is not None else 0
+        game_count = active_game_count + len(challenge_queue)
         if (self.correspondence_game_count(challenge_queue) >= self.correspondence_cfg.max_active_games
-                or not self.should_create_slot_challenge()):
+                or not self.should_create_slot_challenge(game_count)):
             return False
 
         logger.info("Challenging a random bot for a correspondence game")
@@ -355,8 +397,11 @@ class Matchmaking:
         self.update_user_profile()
         match_config = self.correspondence_matchmaking_config()
         bot_username, base_time, increment, days, variant, mode = self.choose_opponent(match_config)
+        if not bot_username:
+            return False
+
         logger.info(f"Will challenge {bot_username} for a {variant} correspondence game.")
-        new_challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode) if bot_username else ""
+        new_challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode)
         logger.info(f"Challenge id is {new_challenge_id or 'None'}.")
         self.correspondence_challenge_id = new_challenge_id
         return bool(new_challenge_id)
